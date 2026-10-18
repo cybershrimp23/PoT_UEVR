@@ -1361,6 +1361,15 @@ bool is_subnautica2_executable() {
     return is_subnautica2;
 }
 
+bool is_path_of_titans_executable() {
+    static const bool is_pot = []() {
+        const auto module_path = utility::get_module_pathw(utility::get_executable());
+        return module_path && uevr::games::is_path_of_titans_executable_path(*module_path);
+    }();
+
+    return is_pot;
+}
+
 bool is_1666amsterdam_executable() {
     static const bool is_1666amsterdam = []() {
         const auto module_path = utility::get_module_pathw(utility::get_executable());
@@ -7788,6 +7797,17 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
         // Keep this game-specific guard enabled for fresh profiles, but let existing profiles override it.
         m_compatibility_subnautica2_native_water->value() = true;
         m_subnautica2_native_water_mode->value() = SUBNAUTICA2_NATIVE_WATER_SAFE_REFLECTIONS;
+    }
+
+    if (is_path_of_titans_executable() && (set_defaults || !cfg.get<bool>("VR_MatchGameFOV").has_value())) {
+        // Path of Titans is only readable in stereo when the eye projection matches the
+        // game FOV. Default it on for fresh profiles and title resets; an existing
+        // user toggle is respected from then on.
+        if (!m_match_game_fov->value()) {
+            spdlog::info("[PoT] Applied title default: MatchGameFOV=true (full Lumen AO preset is enforced by CVarManager)");
+        }
+
+        m_match_game_fov->value() = true;
     }
 
     if (get_runtime() != nullptr && get_runtime()->loaded) {

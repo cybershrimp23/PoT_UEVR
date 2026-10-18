@@ -268,6 +268,8 @@ private:
     int m_aphelion_framegen_runtime_cvar_attempts{0};
     bool m_windrose_shadow_runtime_cvars_done{false};
     int m_windrose_shadow_runtime_cvar_attempts{0};
+    bool m_pot_ao_lumen_runtime_cvars_done{false};
+    int m_pot_ao_lumen_runtime_cvar_attempts{0};
 
     static inline std::mutex s_change_mutex{};
     static inline std::atomic_uint64_t s_change_counter{};

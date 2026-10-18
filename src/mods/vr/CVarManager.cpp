@@ -24,6 +24,7 @@
 #include "CVarManager.hpp"
 #include "SatisfactoryRuntime.hpp"
 #include "mods/VR.hpp"
+#include "mods/GameSpecific.hpp"
 #include "utility/ImGui.hpp"
 #include "utility/Logging.hpp"
 
@@ -170,6 +171,15 @@ bool is_windrose_ue56_dx12_current_game_for_cvars() {
 
         const auto disk_version = sdk::get_file_version_info();
         return disk_version.dwFileVersionMS == 0x00050006;
+    }();
+
+    return result;
+}
+
+bool is_path_of_titans_current_game_for_cvars() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && uevr::games::is_path_of_titans_executable_path(*exe_path);
     }();
 
     return result;
@@ -530,6 +540,92 @@ bool force_windrose_shadow_runtime_cvars_once(int attempt) {
 
     return true;
 }
+
+bool force_pot_ao_lumen_runtime_cvars_once(int attempt) {
+    if (!is_path_of_titans_current_game_for_cvars()) {
+        return true;
+    }
+
+    const auto console_manager = sdk::FConsoleManager::get();
+
+    if (console_manager == nullptr) {
+        return false;
+    }
+
+    struct ForcedCVar {
+        const wchar_t* name;
+        const wchar_t* value;
+    };
+
+    // Path of Titans' per-eye SSAO/TAA shimmer makes the world unreadable in
+    // stereo. The validated preset is the full Lumen path: view-independent
+    // ray GI replaces screen-space AO, SSAO is off, and AA is disabled so the
+    // two eyes cannot diverge. No partial preset has worked for this title.
+    static constexpr std::array forced_cvars{
+        ForcedCVar{L"r.AntiAliasingMethod", L"0"},
+        ForcedCVar{L"r.DynamicGlobalIlluminationMethod", L"1"},
+        ForcedCVar{L"r.Lumen.ScreenProbeGather.RadianceCache.ProbeResolution", L"32"},
+        ForcedCVar{L"r.AmbientOcclusionLevels", L"0"},
+        ForcedCVar{L"r.SSAO.Quality", L"0"},
+    };
+
+    int found{};
+    int set_ok{};
+    int set_failed{};
+    int missing{};
+
+    for (const auto& forced : forced_cvars) {
+        auto object = console_manager->find(forced.name);
+
+        if (object == nullptr) {
+            ++missing;
+            continue;
+        }
+
+        ++found;
+        auto variable = (sdk::IConsoleVariable*)object;
+
+        int before{};
+        int after{};
+        bool ok{};
+
+        try {
+            before = variable->GetInt();
+            ok = variable->Set(forced.value);
+            after = variable->GetInt();
+        } catch (...) {
+            ok = false;
+        }
+
+        if (ok) {
+            ++set_ok;
+        } else {
+            ++set_failed;
+        }
+
+        SPDLOG_INFO(
+            "[PoT][AO/Lumen] forced {}: before={} requested={} after={} ok={}",
+            utility::narrow(forced.name),
+            before,
+            utility::narrow(forced.value),
+            after,
+            ok);
+    }
+
+    if (found == 0) {
+        return false;
+    }
+
+    SPDLOG_INFO(
+        "[PoT][AO/Lumen] preset pass complete attempt={} found={} missing={} set_ok={} set_failed={}",
+        attempt,
+        found,
+        missing,
+        set_ok,
+        set_failed);
+
+    return true;
+}
 }
 
 void CVarManager::process_stalker2_sharpen_priority() {
@@ -863,6 +959,17 @@ void CVarManager::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
         } else if (m_windrose_shadow_runtime_cvar_attempts >= 600) {
             SPDLOG_WARN("[Windrose][UE5.6][ShadowCrash] cvars were not found after {} attempts; giving up", m_windrose_shadow_runtime_cvar_attempts);
             m_windrose_shadow_runtime_cvars_done = true;
+        }
+    }
+
+    if (!m_pot_ao_lumen_runtime_cvars_done) {
+        ++m_pot_ao_lumen_runtime_cvar_attempts;
+
+        if (force_pot_ao_lumen_runtime_cvars_once(m_pot_ao_lumen_runtime_cvar_attempts)) {
+            m_pot_ao_lumen_runtime_cvars_done = true;
+        } else if (m_pot_ao_lumen_runtime_cvar_attempts >= 600) {
+            SPDLOG_WARN("[PoT][AO/Lumen] preset cvars were not found after {} attempts; giving up", m_pot_ao_lumen_runtime_cvar_attempts);
+            m_pot_ao_lumen_runtime_cvars_done = true;
         }
     }
 }

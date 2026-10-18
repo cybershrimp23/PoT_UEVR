@@ -243,6 +243,15 @@ inline bool is_dune_awakening_source_view_extension_path(std::wstring_view path)
            is_dune_awakening_executable_path(path);
 }
 
+inline bool is_path_of_titans_executable_path(std::wstring_view path) {
+    const auto lowered = lowercase_path(path);
+    const auto separator = lowered.find_last_of(L"/\\");
+    const auto filename = std::wstring_view{lowered}.substr(
+        separator == std::wstring::npos ? 0 : separator + 1);
+    return filename == L"pathoftitans-win64-shipping.exe" ||
+        filename == L"pathoftitans-wingdk-shipping.exe";
+}
+
 inline bool is_mechwarrior_clans_executable_path(std::wstring_view path) {
     const auto lowered = lowercase_path(path);
     return lowered.find(L"mechwarrior-win64-shipping") != std::wstring::npos ||
