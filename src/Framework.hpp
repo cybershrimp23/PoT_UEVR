@@ -314,7 +314,7 @@ private:
     bool m_has_frame{false};
     std::atomic<uint64_t> m_d3d12_ui_generation{0};
     bool m_wants_device_object_cleanup{false};
-    bool m_draw_ui{true};
+    bool m_draw_ui{false};
     bool m_last_draw_ui{m_draw_ui};
     bool m_is_ui_focused{false};
     bool m_cursor_state{false};
