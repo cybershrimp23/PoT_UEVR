@@ -8490,6 +8490,27 @@ void VR::on_present() {
         return;
     }
 
+    // Path of Titans: when the headset is first worn, the per-eye cameras can latch
+    // with divergent look-at orientations. The user-validated fix is "Reinitialize
+    // Runtime"; do exactly that once, ~1 second after the first wear is detected.
+    // Consumption happens in on_post_present via runtime->wants_reinitialize.
+    if (is_path_of_titans_executable() && !m_first_wear_reinitialize_done) {
+        if (is_hmd_active()) {
+            const auto now = std::chrono::steady_clock::now();
+
+            if (m_first_wear_seen_time.time_since_epoch().count() == 0) {
+                m_first_wear_seen_time = now;
+                spdlog::info("[PoT] Headset wear detected; scheduling one-time runtime reinitialize in 1s");
+            } else if (now - m_first_wear_seen_time >= std::chrono::seconds(1)) {
+                m_first_wear_reinitialize_done = true;
+                spdlog::info("[PoT] Performing one-time runtime reinitialize after first headset wear");
+                runtime->wants_reinitialize = true;
+            }
+        } else {
+            m_first_wear_seen_time = {};
+        }
+    }
+
     runtime->consume_events(nullptr);
 
     m_fake_stereo_hook->on_frame();

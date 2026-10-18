@@ -2041,6 +2041,11 @@ private:
     bool m_hitch_diagnostics_enabled_last_frame{false};
     bool m_backbuffer_inconsistency{false};
     bool m_init_finished{false};
+
+    // Path of Titans: the first headset wear can latch per-eye cameras with
+    // divergent orientations; a runtime reinitialize shortly after wear fixes it.
+    bool m_first_wear_reinitialize_done{false};
+    std::chrono::steady_clock::time_point m_first_wear_seen_time{};
     bool m_has_hw_scheduling{false}; // hardware accelerated GPU scheduling
     std::atomic_bool m_spoofed_gamepad_connection{false};
     bool m_aim_temp_disabled{false};
