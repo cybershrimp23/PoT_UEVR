@@ -6,12 +6,16 @@
 #include <fstream>
 #include <cmath>
 #include <algorithm>
+#include <cctype>
 #include <cwctype>
 #include <filesystem>
+#include <format>
 #include <iomanip>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include <windows.h>
@@ -40,6 +44,9 @@
 #include <sdk/FStructProperty.hpp>
 #include <sdk/TArray.hpp>
 #include <sdk/UObjectArray.hpp>
+#include <sdk/AActor.hpp>
+#include <sdk/USceneComponent.hpp>
+#include <sdk/UGameEngine.hpp>
 #include <sdk/Utility.hpp>
 
 #include <tracy/Tracy.hpp>
@@ -4853,6 +4860,8 @@ bool VR::should_defer_stalker2_openxr_frame_for_transition(const char* reason) {
 void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     ZoneScopedN(__FUNCTION__);
 
+    update_pot_damage_overlay();
+
     const auto now = std::chrono::steady_clock::now();
     const auto previous_engine_tick = m_last_engine_tick.load(std::memory_order_relaxed);
     const bool hitch_diagnostics_enabled = m_enable_hitch_diagnostics->value();
@@ -8739,6 +8748,332 @@ uint32_t VR::get_hmd_height() const {
     return std::max<uint32_t>(get_runtime()->get_height(), 128);
 }
 
+void VR::dump_scene_tree_to_file() {
+    ZoneScopedN(__FUNCTION__);
+
+    try {
+        const auto dump_start = std::chrono::steady_clock::now();
+
+        const auto engine = sdk::UGameEngine::get();
+        const auto world = engine != nullptr ? engine->get_world() : nullptr;
+
+        if (world == nullptr) {
+            spdlog::warn("[SceneDump] No active world; nothing to dump");
+            return;
+        }
+
+        const auto dir = Framework::get_persistent_dir();
+
+        // Incrementing file name: scene_tree_001.txt, scene_tree_002.txt, ...
+        int next_index = 1;
+        std::error_code ec{};
+
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            const auto filename = entry.path().filename().string();
+
+            if (!filename.starts_with("scene_tree_") || !filename.ends_with(".txt")) {
+                continue;
+            }
+
+            const auto digits = filename.substr(
+                sizeof("scene_tree_") - 1,
+                filename.size() - (sizeof("scene_tree_") - 1) - (sizeof(".txt") - 1));
+
+            if (digits.empty() ||
+                !std::all_of(digits.begin(), digits.end(), [](char c) { return std::isdigit((unsigned char)c) != 0; })) {
+                continue;
+            }
+
+            next_index = std::max(next_index, std::stoi(digits) + 1);
+        }
+
+        const auto path = dir / std::format("scene_tree_{:03}.txt", next_index);
+
+        std::ofstream file{path};
+
+        if (!file) {
+            spdlog::error("[SceneDump] Failed to open {} for writing", path.string());
+            return;
+        }
+
+        // Collect every live actor belonging to the active world in one GObjects
+        // pass, grouped by owning level (the actor's outer).
+        std::map<std::wstring, std::vector<sdk::AActor*>> actors_by_level{};
+        size_t scanned{};
+
+        if (const auto object_array = sdk::FUObjectArray::get(); object_array != nullptr) {
+            const auto object_count = object_array->get_object_count();
+
+            for (auto i = 0; i < object_count; ++i) {
+                const auto item = object_array->get_object(i);
+
+                if (item == nullptr) {
+                    continue;
+                }
+
+                const auto object = item->get_object();
+
+                if (object == nullptr || object->is_pending_kill_or_unreachable()) {
+                    continue;
+                }
+
+                ++scanned;
+
+                const auto uobject = (sdk::UObject*)object;
+
+                if (!uobject->is_a(sdk::AActor::static_class())) {
+                    continue;
+                }
+
+                const auto actor = (sdk::AActor*)uobject;
+
+                if (actor->get_world() != world) {
+                    continue;
+                }
+
+                const auto level = actor->get_outer();
+                const auto level_name = level != nullptr ? level->get_name_safe() : L"<null level>";
+
+                actors_by_level[level_name].push_back(actor);
+            }
+        }
+
+        size_t actor_count{};
+        size_t component_count{};
+
+        for (const auto& [level_name, actors] : actors_by_level) {
+            actor_count += actors.size();
+        }
+
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+
+        file << "UEVR scene tree dump\n";
+        file << "World: " << utility::narrow(world->get_full_name()) << "\n";
+        file << std::format("Time: {:04}-{:02}-{:02} {:02}:{:02}:{:02}\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        file << std::format("Objects scanned: {} | Levels: {} | Actors: {}\n\n",
+            scanned, actors_by_level.size(), actor_count);
+
+        for (const auto& [level_name, actors] : actors_by_level) {
+            file << "=== Level: " << utility::narrow(level_name) << " (" << actors.size() << " actors) ===\n";
+
+            for (const auto actor : actors) {
+                try {
+                    const auto actor_class = actor->get_class();
+                    const auto class_name = actor_class != nullptr ? actor_class->get_name_safe() : L"<unknown class>";
+                    const auto location = actor->get_actor_location();
+
+                    file << std::format("[Actor] {} '{}' @ ({:.1f}, {:.1f}, {:.1f})\n",
+                        utility::narrow(class_name),
+                        utility::narrow(actor->get_full_name()),
+                        location.x, location.y, location.z);
+
+                    const auto root = actor->get_root_component();
+                    const auto components = actor->get_all_components();
+
+                    // Split into scene components (attached hierarchy) and plain components.
+                    std::unordered_map<sdk::USceneComponent*, std::vector<sdk::USceneComponent*>> children{};
+                    std::vector<sdk::USceneComponent*> scene_roots{};
+                    std::vector<sdk::UActorComponent*> plain_components{};
+
+                    for (const auto component : components) {
+                        if (component == nullptr) {
+                            continue;
+                        }
+
+                        ++component_count;
+
+                        if (!component->is_a(sdk::USceneComponent::static_class())) {
+                            plain_components.push_back(component);
+                            continue;
+                        }
+
+                        const auto scene_component = (sdk::USceneComponent*)component;
+                        const auto parent = scene_component->get_attach_parent();
+
+                        if (parent != nullptr) {
+                            children[parent].push_back(scene_component);
+                        } else {
+                            scene_roots.push_back(scene_component);
+                        }
+                    }
+
+                    // Emit the attachment tree, root component first (marked *).
+                    // Depth-limited and cycle-guarded.
+                    std::unordered_set<sdk::USceneComponent*> visited{};
+
+                    const auto write_component = [&](const auto& self, sdk::USceneComponent* component, int32_t depth) -> void {
+                        if (component == nullptr || depth > 64 || !visited.insert(component).second) {
+                            return;
+                        }
+
+                        const auto component_class = component->get_class();
+                        const auto component_class_name = component_class != nullptr ? component_class->get_name_safe() : L"<unknown class>";
+                        const auto component_location = component->get_world_location();
+
+                        file << std::format("{}{}{} '{}' @ ({:.1f}, {:.1f}, {:.1f})\n",
+                            std::string((size_t)depth * 2, ' '),
+                            component == root ? "* " : "",
+                            utility::narrow(component_class_name),
+                            utility::narrow(component->get_full_name()),
+                            component_location.x, component_location.y, component_location.z);
+
+                        if (const auto it = children.find(component); it != children.end()) {
+                            for (const auto child : it->second) {
+                                self(self, child, depth + 1);
+                            }
+                        }
+                    };
+
+                    if (root != nullptr) {
+                        write_component(write_component, root, 1);
+                    }
+
+                    for (const auto scene_root : scene_roots) {
+                        if (scene_root != root) {
+                            write_component(write_component, scene_root, 1);
+                        }
+                    }
+
+                    if (!plain_components.empty()) {
+                        file << "  (non-scene components)\n";
+
+                        for (const auto component : plain_components) {
+                            const auto component_class = component->get_class();
+                            const auto component_class_name = component_class != nullptr ? component_class->get_name_safe() : L"<unknown class>";
+
+                            file << std::format("    {} '{}'\n",
+                                utility::narrow(component_class_name),
+                                utility::narrow(component->get_full_name()));
+                        }
+                    }
+
+                    file << "\n";
+                } catch (const std::exception& e) {
+                    file << "  [dump error for actor: " << e.what() << "]\n\n";
+                } catch (...) {
+                    file << "  [dump error for actor: unknown exception]\n\n";
+                }
+            }
+        }
+
+        const auto dump_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - dump_start);
+
+        file << std::format("=== End of dump: {} actors | {} components | {} ms ===\n",
+            actor_count, component_count, dump_time.count());
+
+        m_last_scene_tree_dump = path;
+
+        spdlog::info("[SceneDump] Wrote {} actors / {} components ({} objects scanned, {} ms) to {}",
+            actor_count, component_count, scanned, dump_time.count(), path.string());
+    } catch (const std::exception& e) {
+        spdlog::error("[SceneDump] Failed: {}", e.what());
+    } catch (...) {
+        spdlog::error("[SceneDump] Failed: unknown exception");
+    }
+}
+
+void VR::update_pot_damage_overlay() {
+    if (!is_path_of_titans_executable()) {
+        return;
+    }
+
+    const auto object_array = sdk::FUObjectArray::get();
+
+    if (object_array == nullptr) {
+        return;
+    }
+
+    const auto object_count = object_array->get_object_count();
+
+    if (object_count <= 0) {
+        return;
+    }
+
+    // Rolling sweep: bounded slice per engine tick so a huge object buffer
+    // cannot hitch the game thread. Widgets the game un-hides (damage events)
+    // are re-hidden within one sweep.
+    constexpr uint32_t slice = 16384;
+
+    if (m_pot_damage_overlay_scan_cursor >= static_cast<uint32_t>(object_count)) {
+        m_pot_damage_overlay_scan_cursor = 0;
+    }
+
+    const auto end = std::min(m_pot_damage_overlay_scan_cursor + slice, static_cast<uint32_t>(object_count));
+
+    for (auto i = m_pot_damage_overlay_scan_cursor; i < end; ++i) {
+        try {
+            const auto item = object_array->get_object(static_cast<int32_t>(i));
+
+            if (item == nullptr) {
+                continue;
+            }
+
+            const auto object = item->get_object();
+
+            if (object == nullptr || IsBadReadPtr(object, sizeof(void*) * 4) || object->is_pending_kill_or_unreachable()) {
+                continue;
+            }
+
+            if (object->get_name_safe() != L"DamageImage") {
+                continue;
+            }
+
+            const auto full_name = object->get_full_name();
+
+            if (full_name.find(L"Default__") != std::wstring::npos) {
+                // Class default object: template state, not live UI.
+                continue;
+            }
+
+            auto klass = object->get_class();
+            bool is_widget = false;
+
+            for (auto depth = 0; klass != nullptr && depth < 16; ++depth) {
+                if (klass->get_name_safe() == L"Widget") {
+                    is_widget = true;
+                    break;
+                }
+
+                klass = (sdk::UClass*)klass->get_super_struct();
+            }
+
+            if (!is_widget) {
+                continue;
+            }
+
+            constexpr uint8_t hidden_mode = 2; // EVisibility::Hidden
+
+            const auto visibility = ((sdk::UObject*)object)->get_property_data(L"Visibility");
+
+            if (visibility != nullptr && *(const uint8_t*)visibility == hidden_mode) {
+                continue;
+            }
+
+            const auto tracked = std::any_of(m_pot_hidden_damage_widgets.begin(), m_pot_hidden_damage_widgets.end(),
+                [object](const auto& entry) { return entry.object == object; });
+
+            if (!tracked) {
+                m_pot_hidden_damage_widgets.push_back(PotHiddenWidget{
+                    object,
+                    i,
+                    item->get_serial_number(),
+                });
+
+                spdlog::info("[PoT][DamageOverlay] Hiding blood damage widget '{}'", utility::narrow(full_name));
+            }
+
+            object->call_function(L"SetVisibility", (void*)&hidden_mode);
+        } catch (...) {
+            continue;
+        }
+    }
+
+    m_pot_damage_overlay_scan_cursor = end >= static_cast<uint32_t>(object_count) ? 0 : end;
+}
+
 void VR::on_draw_sidebar_entry(std::string_view name) {
     const auto hash = utility::hash(name.data());
 
@@ -9704,6 +10039,19 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         ImGui::DragFloat2("Right Stick", (float*)&right_stick_axis, 0.01f, -1.0f, 1.0f);
 
         ImGui::TextWrapped("Hardware scheduling: %s", m_has_hw_scheduling ? "Enabled" : "Disabled");
+
+        ImGui::Separator();
+        if (ImGui::Button("Dump Scene Tree")) {
+            dump_scene_tree_to_file();
+        }
+
+        if (!m_last_scene_tree_dump.empty()) {
+            ImGui::SameLine();
+            ImGui::TextWrapped("Last dump: %s", m_last_scene_tree_dump.filename().string().c_str());
+        } else {
+            ImGui::SameLine();
+            ImGui::TextWrapped("Writes scene_tree_NNN.txt to the UEVR game folder (%%APPDATA%%\\UnrealVRMod\\<exe>)");
+        }
     }
 
     ImGui::EndGroup();

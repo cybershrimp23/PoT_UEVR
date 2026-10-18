@@ -199,6 +199,16 @@ public:
     void update_action_states(bool from_stalled_xinput = false);
     void update_dpad_gestures();
 
+    // Writes a text dump of the active world's actor/component hierarchy to
+    // %APPDATA%\UnrealVRMod\<exe-stem>\scene_tree_NNN.txt (incrementing).
+    void dump_scene_tree_to_file();
+    const auto& get_last_scene_tree_dump() const { return m_last_scene_tree_dump; }
+
+    // Path of Titans: the UMG blood damage overlay (widget "DamageImage") draws a
+    // flat-screen rectangle inside the stereo view. Hide it unconditionally for
+    // this title, like the legacy Lua script did.
+    void update_pot_damage_overlay();
+
     void reinitialize_renderer() {
         if (m_is_d3d12) {
             m_d3d12.force_reset();
@@ -2041,6 +2051,16 @@ private:
     bool m_hitch_diagnostics_enabled_last_frame{false};
     bool m_backbuffer_inconsistency{false};
     bool m_init_finished{false};
+    std::filesystem::path m_last_scene_tree_dump{};
+
+    // Path of Titans damage overlay hiding: rolling GObjects sweep state.
+    struct PotHiddenWidget {
+        sdk::UObjectBase* object{nullptr};
+        uint32_t index{};
+        int32_t serial{};
+    };
+    std::vector<PotHiddenWidget> m_pot_hidden_damage_widgets{};
+    uint32_t m_pot_damage_overlay_scan_cursor{0};
 
     // Path of Titans: the first headset wear can latch per-eye cameras with
     // divergent orientations; a runtime reinitialize shortly after wear fixes it.
