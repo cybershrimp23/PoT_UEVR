@@ -4,9 +4,15 @@
 #include <optional>
 #include <cstdint>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 
+#include <d3d12.h>
+#include <wrl/client.h>
+
 #include "Mod.hpp"
+#include "d3d12/TextureContext.hpp"
 
 #include "imgui.h"
 
@@ -63,6 +69,32 @@ public:
         return std::clamp(m_ui_invert_alpha->value(), 0.0f, 1.0f);
     }
 
+    // Path of Titans procedural vignette overlays: one shared CPU-generated
+    // radial gradient D3D12 texture, four head-locked SteamVR overlay slots.
+    // Mirrors the verified implementation from the research fork.
+    static constexpr int POT_VIGNETTE_SLOT_RED = 0;
+    static constexpr int POT_VIGNETTE_SLOT_GREEN = 1;
+    static constexpr int POT_VIGNETTE_SLOT_BLUE = 2;
+    static constexpr int POT_VIGNETTE_SLOT_MOTION = 3;
+    static constexpr int POT_VIGNETTE_SLOT_COUNT = 4;
+
+    // Written from the game thread; consumed by the present thread.
+    // Alpha may exceed 1.0; SteamVR decides what to do with the headroom.
+    void set_pot_vignette_alpha(int slot, float alpha) {
+        if (slot < 0 || slot >= POT_VIGNETTE_SLOT_COUNT) {
+            return;
+        }
+
+        m_pot_vignette_alphas[slot].store(std::clamp(alpha, 0.0f, 8.0f), std::memory_order_relaxed);
+    }
+
+    bool is_pot_vignette_enabled() const {
+        return m_pot_vignette_enabled->value();
+    }
+
+    // Drawn on the VR menu's Path of Titans sidebar page.
+    void draw_pot_vignette_ui();
+
 private:
     // Cached data for imgui VR overlay so we know when we need to update it
     // instead of doing it constantly every frame
@@ -92,6 +124,22 @@ private:
     vr::VROverlayHandle_t m_overlay_handle{};
     vr::VROverlayHandle_t m_thumbnail_handle{};
     vr::VROverlayHandle_t m_slate_overlay_handle{};
+
+    vr::VROverlayHandle_t m_pot_vignette_handles[POT_VIGNETTE_SLOT_COUNT]{};
+
+    // GPU-rendered vignette falloff: 512x512 render-target texture refilled by
+    // a fullscreen-triangle pixel shader whenever Start/End/SolidDebug change.
+    d3d12::TextureContext m_pot_vignette_ctx{};
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_pot_vignette_root_sig{};
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_pot_vignette_pso{};
+    float m_pot_vignette_last_start{-1.0f};
+    float m_pot_vignette_last_end{-1.0f};
+    bool m_pot_vignette_last_solid{false};
+    bool m_pot_vignette_in_psr{false};
+
+    std::array<std::atomic<float>, POT_VIGNETTE_SLOT_COUNT> m_pot_vignette_alphas{{}};
+    std::array<bool, POT_VIGNETTE_SLOT_COUNT> m_pot_vignette_shown{};
+    std::chrono::steady_clock::time_point m_pot_vignette_fail_backoff{};
 
     bool m_closed_ui{false};
     bool m_just_closed_ui{false};
@@ -125,6 +173,28 @@ private:
     const ModToggle::Ptr m_ui_follows_view{ ModToggle::create("UI_FollowView", false) };
     const ModSlider::Ptr m_ui_invert_alpha{ ModSlider::create("UI_InvertAlpha", 0.0f, 1.0f, 0.01f) };
 
+    // Path of Titans vignette overlays.
+    const ModToggle::Ptr m_pot_vignette_enabled{ ModToggle::create("PotVignette_Enabled", true) };
+    const ModToggle::Ptr m_pot_vignette_damage_enabled{ ModToggle::create("PotVignette_DamageEnabled", true) };
+    const ModToggle::Ptr m_pot_vignette_motion_enabled{ ModToggle::create("PotVignette_MotionEnabled", true) };
+    const ModSlider::Ptr m_pot_vignette_size{ ModSlider::create("PotVignette_Size", 0.5f, 8.0f, 4.0f) };
+    const ModSlider::Ptr m_pot_vignette_distance{ ModSlider::create("PotVignette_Distance", 0.2f, 5.0f, 1.0f) };
+    const ModSlider::Ptr m_pot_vignette_start{ ModSlider::create("PotVignette_Start", 0.05f, 1.0f, 0.55f) };
+    const ModSlider::Ptr m_pot_vignette_end{ ModSlider::create("PotVignette_End", 0.1f, 1.5f, 0.95f) };
+    const ModSlider::Ptr m_pot_vignette_red_r{ ModSlider::create("PotVignette_Red_R", 0.0f, 1.0f, 1.0f) };
+    const ModSlider::Ptr m_pot_vignette_red_g{ ModSlider::create("PotVignette_Red_G", 0.0f, 1.0f, 0.0f) };
+    const ModSlider::Ptr m_pot_vignette_red_b{ ModSlider::create("PotVignette_Red_B", 0.0f, 1.0f, 0.0f) };
+    const ModSlider::Ptr m_pot_vignette_green_r{ ModSlider::create("PotVignette_Green_R", 0.0f, 1.0f, 0.0f) };
+    const ModSlider::Ptr m_pot_vignette_green_g{ ModSlider::create("PotVignette_Green_G", 0.0f, 1.0f, 1.0f) };
+    const ModSlider::Ptr m_pot_vignette_green_b{ ModSlider::create("PotVignette_Green_B", 0.0f, 1.0f, 0.0f) };
+    const ModSlider::Ptr m_pot_vignette_blue_r{ ModSlider::create("PotVignette_Blue_R", 0.0f, 1.0f, 0.0f) };
+    const ModSlider::Ptr m_pot_vignette_blue_g{ ModSlider::create("PotVignette_Blue_G", 0.0f, 1.0f, 0.35f) };
+    const ModSlider::Ptr m_pot_vignette_blue_b{ ModSlider::create("PotVignette_Blue_B", 0.0f, 1.0f, 1.0f) };
+    const ModSlider::Ptr m_pot_vignette_motion_r{ ModSlider::create("PotVignette_Motion_R", 0.0f, 1.0f, 0.0f) };
+    const ModSlider::Ptr m_pot_vignette_motion_g{ ModSlider::create("PotVignette_Motion_G", 0.0f, 1.0f, 0.0f) };
+    const ModSlider::Ptr m_pot_vignette_motion_b{ ModSlider::create("PotVignette_Motion_B", 0.0f, 1.0f, 0.0f) };
+    const ModToggle::Ptr m_pot_vignette_solid_debug{ ModToggle::create("PotVignette_SolidDebug", false) };
+
     const ModSlider::Ptr m_framework_distance{ ModSlider::create("UI_Framework_Distance", 0.5f, 10.0f, 1.75f) };
     const ModSlider::Ptr m_framework_size{ ModSlider::create("UI_Framework_Size", 0.5f, 10.0f, 2.0f) };
     const ModToggle::Ptr m_framework_ui_follows_view{ ModToggle::create("UI_Framework_FollowView", false) };
@@ -148,7 +218,27 @@ public:
             *m_framework_size,
             *m_framework_ui_follows_view,
             *m_framework_wrist_ui,
-            *m_framework_mouse_emulation
+            *m_framework_mouse_emulation,
+            *m_pot_vignette_enabled,
+            *m_pot_vignette_damage_enabled,
+            *m_pot_vignette_motion_enabled,
+            *m_pot_vignette_size,
+            *m_pot_vignette_distance,
+            *m_pot_vignette_start,
+            *m_pot_vignette_end,
+            *m_pot_vignette_red_r,
+            *m_pot_vignette_red_g,
+            *m_pot_vignette_red_b,
+            *m_pot_vignette_green_r,
+            *m_pot_vignette_green_g,
+            *m_pot_vignette_green_b,
+            *m_pot_vignette_blue_r,
+            *m_pot_vignette_blue_g,
+            *m_pot_vignette_blue_b,
+            *m_pot_vignette_motion_r,
+            *m_pot_vignette_motion_g,
+            *m_pot_vignette_motion_b,
+            *m_pot_vignette_solid_debug
         };
     }
 
@@ -202,4 +292,7 @@ private:
     void update_overlay_openvr();
     bool update_wrist_overlay_openvr();
     void update_slate_openvr();
+    bool ensure_pot_vignette_texture_dx12();
+    bool build_pot_vignette_pipeline_dx12(ID3D12Device* device);
+    void update_pot_vignette_pool_openvr();
 };}

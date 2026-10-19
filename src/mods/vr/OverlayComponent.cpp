@@ -1,3 +1,5 @@
+#define NOMINMAX
+
 #include <algorithm>
 #include <cmath>
 #include <optional>
@@ -6,13 +8,21 @@
 #include <glm/gtx/intersect.hpp>
 #include <imgui_internal.h>
 
+#include <d3dcompiler.h>
+
+#pragma comment(lib, "d3dcompiler")
+
 #include "Framework.hpp"
 #include "../VR.hpp"
 #include "../utility/ImGui.hpp"
+#include "d3d12/CommandContext.hpp"
+#include "utility/Logging.hpp"
 
 #include "OverlayComponent.hpp"
 
 namespace vrmod {
+using Microsoft::WRL::ComPtr;
+
 void OverlayComponent::on_reset() {
     m_overlay_data = {};
     m_openxr.reset_daysgone_ahud_pose();
@@ -71,6 +81,28 @@ std::optional<std::string> OverlayComponent::on_initialize_openvr() {
         if (overlay_error != vr::VROverlayError_None) {
             return "VROverlay failed to set overlay input method: " + std::string{vr::VROverlay()->GetOverlayErrorNameFromEnum(overlay_error)};
         }
+    }
+
+    // Path of Titans procedural vignette overlays: own CPU gradient texture,
+    // hidden until their drivers raise alpha above zero.
+    static constexpr const char* s_pot_vignette_names[POT_VIGNETTE_SLOT_COUNT] {
+        "PotVignetteRed",
+        "PotVignetteGreen",
+        "PotVignetteBlue",
+        "PotVignetteMotion",
+    };
+
+    for (auto i = 0; i < POT_VIGNETTE_SLOT_COUNT; ++i) {
+        if (!create_overlay(s_pot_vignette_names[i], m_pot_vignette_size->value(), m_pot_vignette_handles[i])) {
+            auto overlay_error = vr::VROverlay()->SetOverlayInputMethod(m_pot_vignette_handles[i], vr::VROverlayInputMethod_None);
+
+            if (overlay_error != vr::VROverlayError_None) {
+                return "VROverlay failed to set vignette input method: " + std::string{vr::VROverlay()->GetOverlayErrorNameFromEnum(overlay_error)};
+            }
+        }
+
+        vr::VROverlay()->HideOverlay(m_pot_vignette_handles[i]);
+        m_pot_vignette_alphas[i].store(0.0f, std::memory_order_relaxed);
     }
 
     return std::nullopt;
@@ -192,6 +224,7 @@ void OverlayComponent::update_input_mouse_emulation() {
 void OverlayComponent::on_post_compositor_submit() {
     this->update_overlay_openvr();
     this->update_slate_openvr();
+    this->update_pot_vignette_pool_openvr();
 }
 
 
@@ -1250,5 +1283,469 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
     }
 
     return layer;
+}
+
+bool OverlayComponent::build_pot_vignette_pipeline_dx12(ID3D12Device* device) {
+    if (m_pot_vignette_root_sig != nullptr && m_pot_vignette_pso != nullptr) {
+        return true;
+    }
+
+    // Fullscreen-triangle falloff shader: RGB white (color modulated live via
+    // SetOverlayColor), A radial smoothstep identical to the old CPU loop.
+    // SolidDebug => fully opaque quad (compositor-level isolation test).
+    static const char* s_vignette_vs = R"hlsl(
+struct VSOut {
+    float4 pos : SV_Position;
+};
+
+VSOut vs_main(uint vid : SV_VertexID) {
+    VSOut o;
+    o.pos = float4(vid == 1 ? 3.0f : -1.0f, vid == 2 ? 3.0f : -1.0f, 0.0f, 1.0f);
+    return o;
+}
+)hlsl";
+
+    static const char* s_vignette_ps = R"hlsl(
+cbuffer VignetteParams : register(b0) {
+    float g_start;
+    float g_end;
+    float g_solid;
+    float g_pad;
+};
+
+struct PSOut {
+    float4 color : SV_Target;
+};
+
+PSOut ps_main(float4 pos : SV_Position) {
+    const float half_size = 256.0f; // 512 / 2
+    const float dx = (pos.x - 0.5f - half_size) / half_size;
+    const float dy = (pos.y - 0.5f - half_size) / half_size;
+
+    float s = 1.0f;
+
+    if (g_solid < 0.5f) {
+        const float dist = sqrt(dx * dx + dy * dy) / 1.41421356f * 2.0f;
+        float t = (dist - g_start) / max(g_end - g_start, 0.0001f);
+        t = saturate(t);
+        s = t * t * (3.0f - 2.0f * t);
+    }
+
+    PSOut o;
+    o.color = float4(1.0f, 1.0f, 1.0f, s);
+    return o;
+}
+)hlsl";
+
+    ComPtr<ID3DBlob> vs_blob{};
+    ComPtr<ID3DBlob> ps_blob{};
+    ComPtr<ID3DBlob> err_blob{};
+
+    if (FAILED(D3DCompile(s_vignette_vs, strlen(s_vignette_vs), "pot_vignette_vs", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &vs_blob, &err_blob))
+        || FAILED(D3DCompile(s_vignette_ps, strlen(s_vignette_ps), "pot_vignette_ps", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0, &ps_blob, &err_blob))) {
+        SPDLOG_ERROR("[PotVignette] shader compile failed: {}", err_blob != nullptr ? (const char*)err_blob->GetBufferPointer() : "unknown");
+        return false;
+    }
+
+    D3D12_ROOT_PARAMETER root_params[1]{};
+    root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    root_params[0].Constants.ShaderRegister = 0;
+    root_params[0].Constants.RegisterSpace = 0;
+    root_params[0].Constants.Num32BitValues = 4;
+    root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.NumParameters = 1;
+    root_desc.pParameters = root_params;
+    root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    // Resolve the serializer from the already-loaded d3d12.dll (UEVR does not
+    // statically link d3d12.lib; same approach as the imgui DX12 backend).
+    using SerializeRootSignatureFn = HRESULT(WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
+
+    const auto d3d12_module = GetModuleHandleW(L"d3d12.dll");
+
+    if (d3d12_module == nullptr) {
+        SPDLOG_ERROR("[PotVignette] d3d12.dll not loaded");
+        return false;
+    }
+
+    const auto serialize = (SerializeRootSignatureFn)GetProcAddress(d3d12_module, "D3D12SerializeRootSignature");
+
+    if (serialize == nullptr) {
+        SPDLOG_ERROR("[PotVignette] D3D12SerializeRootSignature unavailable");
+        return false;
+    }
+
+    ComPtr<ID3DBlob> root_blob{};
+
+    if (FAILED(serialize(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &root_blob, &err_blob))
+        || FAILED(device->CreateRootSignature(0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(), IID_PPV_ARGS(&m_pot_vignette_root_sig)))) {
+        SPDLOG_ERROR("[PotVignette] root signature creation failed");
+        m_pot_vignette_root_sig.Reset();
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = m_pot_vignette_root_sig.Get();
+    pso_desc.VS = { vs_blob->GetBufferPointer(), vs_blob->GetBufferSize() };
+    pso_desc.PS = { ps_blob->GetBufferPointer(), ps_blob->GetBufferSize() };
+
+    D3D12_BLEND_DESC& blend = pso_desc.BlendState;
+    blend.AlphaToCoverageEnable = FALSE;
+    blend.IndependentBlendEnable = FALSE;
+    for (auto& target : blend.RenderTarget) {
+        target.BlendEnable = FALSE;
+        target.LogicOp = D3D12_LOGIC_OP_NOOP;
+        target.SrcBlend = D3D12_BLEND_ONE;
+        target.DestBlend = D3D12_BLEND_ZERO;
+        target.BlendOp = D3D12_BLEND_OP_ADD;
+        target.SrcBlendAlpha = D3D12_BLEND_ONE;
+        target.DestBlendAlpha = D3D12_BLEND_ZERO;
+        target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        target.LogicOpEnable = FALSE;
+        target.LogicOp = D3D12_LOGIC_OP_NOOP;
+        target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+
+    pso_desc.SampleMask = UINT_MAX;
+
+    D3D12_RASTERIZER_DESC& raster = pso_desc.RasterizerState;
+    raster.FillMode = D3D12_FILL_MODE_SOLID;
+    raster.CullMode = D3D12_CULL_MODE_NONE;
+    raster.FrontCounterClockwise = FALSE;
+    raster.DepthBias = 0;
+    raster.DepthBiasClamp = 0.0f;
+    raster.SlopeScaledDepthBias = 0.0f;
+    raster.DepthClipEnable = TRUE;
+    raster.MultisampleEnable = FALSE;
+    raster.AntialiasedLineEnable = FALSE;
+
+    D3D12_DEPTH_STENCIL_DESC& depth = pso_desc.DepthStencilState;
+    depth.DepthEnable = FALSE;
+    depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    depth.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    depth.StencilEnable = FALSE;
+    depth.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    depth.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    depth.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    depth.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    depth.FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    depth.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    depth.BackFace = depth.FrontFace;
+
+    pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso_desc.NumRenderTargets = 1;
+    pso_desc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    pso_desc.SampleDesc.Count = 1;
+
+    if (FAILED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&m_pot_vignette_pso)))) {
+        SPDLOG_ERROR("[PotVignette] pipeline state creation failed");
+        m_pot_vignette_pso.Reset();
+        return false;
+    }
+
+    SPDLOG_INFO("[PotVignette] GPU falloff pipeline compiled");
+    return true;
+}
+
+bool OverlayComponent::ensure_pot_vignette_texture_dx12() {
+    const auto start = m_pot_vignette_start->value();
+    const auto end = m_pot_vignette_end->value();
+    const bool solid = m_pot_vignette_solid_debug->value();
+
+    const auto device = g_framework->get_d3d12_hook()->get_device();
+    if (device == nullptr) {
+        SPDLOG_ERROR_EVERY_N_SEC(5, "[PotVignette] no D3D12 device yet");
+        return false;
+    }
+
+    constexpr uint32_t SIZE = 512;
+
+    bool needs_render = false;
+
+    if (m_pot_vignette_ctx.texture == nullptr) {
+        if (!build_pot_vignette_pipeline_dx12(device)) {
+            return false;
+        }
+
+        // Render-target-capable texture in the same resource style the OpenVR
+        // UI texture uses for compositor submission.
+        D3D12_RESOURCE_DESC tex_desc{};
+        tex_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        tex_desc.Width = SIZE;
+        tex_desc.Height = SIZE;
+        tex_desc.DepthOrArraySize = 1;
+        tex_desc.MipLevels = 1;
+        tex_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        tex_desc.SampleDesc.Count = 1;
+        tex_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        tex_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+        D3D12_CLEAR_VALUE clear_value{};
+        clear_value.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+
+        ComPtr<ID3D12Resource> tex{};
+        D3D12_HEAP_PROPERTIES default_heap{};
+        default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        if (FAILED(device->CreateCommittedResource(
+                &default_heap, D3D12_HEAP_FLAG_NONE, &tex_desc,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, &clear_value, IID_PPV_ARGS(&tex)))) {
+            SPDLOG_ERROR("[PotVignette] failed to create vignette texture");
+            return false;
+        }
+
+        if (!m_pot_vignette_ctx.setup(device, tex.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, L"PotVignetteTexture")) {
+            SPDLOG_ERROR("[PotVignette] failed to set up vignette texture context");
+            m_pot_vignette_ctx.reset();
+            return false;
+        }
+
+        m_pot_vignette_in_psr = false;
+        needs_render = true;
+    } else {
+        needs_render = start != m_pot_vignette_last_start || end != m_pot_vignette_last_end || solid != m_pot_vignette_last_solid;
+
+        if (!needs_render) {
+            return true; // idle: no CPU or GPU work at all
+        }
+
+        if (!build_pot_vignette_pipeline_dx12(device)) {
+            return false;
+        }
+    }
+
+    d3d12::CommandContext render_ctx{};
+    if (!render_ctx.setup(L"PotVignetteRender") || !render_ctx.ready()) {
+        SPDLOG_ERROR_EVERY_N_SEC(5, "[PotVignette] render CommandContext unavailable");
+        return false;
+    }
+
+    auto* cmd = render_ctx.cmd_list.Get();
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.Transition.pResource = m_pot_vignette_ctx.texture.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    if (m_pot_vignette_in_psr) {
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        cmd->ResourceBarrier(1, &barrier);
+    }
+
+    const float clear_color[4]{1.0f, 1.0f, 1.0f, 0.0f};
+    const auto rtv = m_pot_vignette_ctx.get_rtv();
+    cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    cmd->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
+
+    D3D12_VIEWPORT viewport{0.0f, 0.0f, (FLOAT)SIZE, (FLOAT)SIZE, 0.0f, 1.0f};
+    D3D12_RECT scissor{0, 0, (LONG)SIZE, (LONG)SIZE};
+    cmd->RSSetViewports(1, &viewport);
+    cmd->RSSetScissorRects(1, &scissor);
+
+    cmd->SetGraphicsRootSignature(m_pot_vignette_root_sig.Get());
+    cmd->SetPipelineState(m_pot_vignette_pso.Get());
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    const float params[4]{start, end, solid ? 1.0f : 0.0f, 0.0f};
+    cmd->SetGraphicsRoot32BitConstants(0, 4, params, 0);
+    cmd->DrawInstanced(3, 1, 0, 0);
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    cmd->ResourceBarrier(1, &barrier);
+
+    // execute() only submits when has_commands is set (raw cmd_list recording
+    // does not set it; lesson from the research fork).
+    render_ctx.has_commands = true;
+    render_ctx.execute();
+    render_ctx.wait(INFINITE);
+
+    m_pot_vignette_in_psr = true;
+    m_pot_vignette_last_start = start;
+    m_pot_vignette_last_end = end;
+    m_pot_vignette_last_solid = solid;
+
+    SPDLOG_INFO("[PotVignette] falloff rendered on GPU [{}x{} start={} end={} solid={}]", SIZE, SIZE, start, end, solid);
+    return true;
+}
+
+void OverlayComponent::update_pot_vignette_pool_openvr() {
+    if (m_pot_vignette_handles[POT_VIGNETTE_SLOT_RED] == 0 || vr::VROverlay() == nullptr || vr::VRSystem() == nullptr) {
+        return;
+    }
+
+    // The texture upload path is D3D12/OpenVR-only (PoT's verified config).
+    if (!g_framework->is_dx12()) {
+        return;
+    }
+
+    const auto hide_slot = [&](int slot) {
+        if (m_pot_vignette_handles[slot] != 0) {
+            vr::VROverlay()->HideOverlay(m_pot_vignette_handles[slot]);
+
+            if (m_pot_vignette_shown[slot]) {
+                m_pot_vignette_shown[slot] = false;
+                spdlog::info("[PotVignette] slot {} hidden", slot);
+            }
+        }
+    };
+
+    if (!m_pot_vignette_enabled->value()) {
+        for (auto slot = 0; slot < POT_VIGNETTE_SLOT_COUNT; ++slot) {
+            hide_slot(slot);
+        }
+        m_pot_vignette_fail_backoff = {};
+        return;
+    }
+
+    // failure backoff: retry the upload at most every 1s while broken
+    const auto now = std::chrono::steady_clock::now();
+    if (m_pot_vignette_fail_backoff > now) {
+        return;
+    }
+
+    if (!ensure_pot_vignette_texture_dx12()) {
+        m_pot_vignette_fail_backoff = now + std::chrono::milliseconds(1000);
+        for (auto slot = 0; slot < POT_VIGNETTE_SLOT_COUNT; ++slot) {
+            hide_slot(slot);
+        }
+        return;
+    }
+
+    // Every SetOverlay* return code is checked: a silently failing call looks
+    // identical to "nothing changes".
+    const auto check = [&](const char* what, vr::EVROverlayError e) {
+        if (e != vr::VROverlayError_None) {
+            SPDLOG_ERROR_EVERY_N_SEC(2, "[PotVignette] {} failed: {}", what,
+                vr::VROverlay()->GetOverlayErrorNameFromEnum(e));
+        }
+    };
+
+    // head-locked: same pose source as the slate follows-view branch
+    vr::TrackedDevicePose_t pose{};
+    vr::VRSystem()->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, &pose, 1);
+    const auto pose_mat = glm::rowMajor4(Matrix4x4f{*(Matrix3x4f*)&pose.mDeviceToAbsoluteTracking});
+    const auto head_rotation = glm::extractMatrixRotation(pose_mat);
+
+    static bool first_update_logged = false;
+
+    for (auto slot = 0; slot < POT_VIGNETTE_SLOT_COUNT; ++slot) {
+        const auto handle = m_pot_vignette_handles[slot];
+
+        if (handle == 0) {
+            continue;
+        }
+
+        const auto slot_enabled = (slot == POT_VIGNETTE_SLOT_MOTION)
+            ? m_pot_vignette_motion_enabled->value()
+            : m_pot_vignette_damage_enabled->value();
+
+        const auto alpha = m_pot_vignette_alphas[slot].load(std::memory_order_relaxed);
+
+        if (!slot_enabled || alpha <= 0.002f) {
+            hide_slot(slot);
+            continue;
+        }
+
+        float r{};
+        float g{};
+        float b{};
+
+        switch (slot) {
+        case POT_VIGNETTE_SLOT_RED:
+            r = m_pot_vignette_red_r->value(); g = m_pot_vignette_red_g->value(); b = m_pot_vignette_red_b->value();
+            break;
+        case POT_VIGNETTE_SLOT_GREEN:
+            r = m_pot_vignette_green_r->value(); g = m_pot_vignette_green_g->value(); b = m_pot_vignette_green_b->value();
+            break;
+        case POT_VIGNETTE_SLOT_BLUE:
+            r = m_pot_vignette_blue_r->value(); g = m_pot_vignette_blue_g->value(); b = m_pot_vignette_blue_b->value();
+            break;
+        default:
+            r = m_pot_vignette_motion_r->value(); g = m_pot_vignette_motion_g->value(); b = m_pot_vignette_motion_b->value();
+            break;
+        }
+
+        vr::VROverlay()->ShowOverlay(handle);
+
+        if (!m_pot_vignette_shown[slot]) {
+            m_pot_vignette_shown[slot] = true;
+            spdlog::info("[PotVignette] slot {} showing (alpha={:.3f})", slot, alpha);
+        }
+        check("SetOverlayColor", vr::VROverlay()->SetOverlayColor(handle, r, g, b));
+        check("SetOverlayAlpha", vr::VROverlay()->SetOverlayAlpha(handle, std::max(alpha, 0.0f)));
+        check("SetOverlayWidthInMeters", vr::VROverlay()->SetOverlayWidthInMeters(handle, m_pot_vignette_size->value()));
+
+        auto glm_matrix = head_rotation;
+        glm_matrix[3] += pose_mat[3];
+        glm_matrix[3] -= glm_matrix[2] * m_pot_vignette_distance->value();
+        glm_matrix[3].w = 1.0f;
+
+        const auto steamvr_matrix = Matrix3x4f{glm::rowMajor4(glm_matrix)};
+        check("SetOverlayTransformAbsolute", vr::VROverlay()->SetOverlayTransformAbsolute(handle, vr::TrackingUniverseStanding, (vr::HmdMatrix34_t*)&steamvr_matrix));
+
+        vr::D3D12TextureData_t texture_data{
+            m_pot_vignette_ctx.texture.Get(),
+            g_framework->get_d3d12_hook()->get_command_queue(),
+            0
+        };
+        vr::Texture_t tex{(void*)&texture_data, vr::TextureType_DirectX12, vr::ColorSpace_Auto};
+        check("SetOverlayTexture", vr::VROverlay()->SetOverlayTexture(handle, &tex));
+
+        if (!first_update_logged) {
+            first_update_logged = true;
+            SPDLOG_INFO("[PotVignette] overlay update loop running (slot={} alpha={} size={}m dist={}m)",
+                slot, alpha, m_pot_vignette_size->value(), m_pot_vignette_distance->value());
+        }
+    }
+}
+
+void OverlayComponent::draw_pot_vignette_ui() {
+    ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+    if (ImGui::TreeNode("Procedural Vignette Overlays")) {
+        m_pot_vignette_enabled->draw("Enable Vignettes");
+
+        if (m_pot_vignette_enabled->value()) {
+            m_pot_vignette_size->draw("Size (m)");
+            m_pot_vignette_distance->draw("Distance (m)");
+            m_pot_vignette_start->draw("Start (inner radius)");
+            m_pot_vignette_end->draw("End (outer radius)");
+
+            const auto color_row = [](const char* label, const ModSlider::Ptr& r, const ModSlider::Ptr& g, const ModSlider::Ptr& b) {
+                float rgb[3] { r->value(), g->value(), b->value() };
+                if (ImGui::ColorEdit3(label, rgb)) {
+                    r->value() = rgb[0];
+                    g->value() = rgb[1];
+                    b->value() = rgb[2];
+                }
+            };
+
+            ImGui::Separator();
+            m_pot_vignette_damage_enabled->draw("Damage Vignettes");
+            if (m_pot_vignette_damage_enabled->value()) {
+                ImGui::Indent();
+                color_row("Red damage", m_pot_vignette_red_r, m_pot_vignette_red_g, m_pot_vignette_red_b);
+                color_row("Green damage", m_pot_vignette_green_r, m_pot_vignette_green_g, m_pot_vignette_green_b);
+                color_row("Blue damage", m_pot_vignette_blue_r, m_pot_vignette_blue_g, m_pot_vignette_blue_b);
+                ImGui::TextWrapped("Green/blue mirror once their widgets are discovered in the log.");
+                ImGui::Unindent();
+            }
+
+            ImGui::Separator();
+            m_pot_vignette_motion_enabled->draw("Camera Rotation Vignette");
+            if (m_pot_vignette_motion_enabled->value()) {
+                ImGui::Indent();
+                color_row("Rotation color", m_pot_vignette_motion_r, m_pot_vignette_motion_g, m_pot_vignette_motion_b);
+                ImGui::Unindent();
+            }
+        }
+
+        m_pot_vignette_solid_debug->draw("DEBUG: solid opaque quads (isolation test)");
+        ImGui::TreePop();
+    }
 }
 }

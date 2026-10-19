@@ -35,6 +35,7 @@
 #include <sdk/ConsoleManager.hpp>
 #include <sdk/threading/GameThreadWorker.hpp>
 #include <sdk/UGameplayStatics.hpp>
+#include <sdk/UWorld.hpp>
 #include <sdk/APlayerController.hpp>
 #include <sdk/APlayerCameraManager.hpp>
 #include <sdk/UEngine.hpp>
@@ -42,6 +43,8 @@
 #include <sdk/UFunction.hpp>
 #include <sdk/FBoolProperty.hpp>
 #include <sdk/FStructProperty.hpp>
+#include <sdk/FArrayProperty.hpp>
+#include <sdk/FProperty.hpp>
 #include <sdk/TArray.hpp>
 #include <sdk/UObjectArray.hpp>
 #include <sdk/AActor.hpp>
@@ -4861,6 +4864,7 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     ZoneScopedN(__FUNCTION__);
 
     update_pot_damage_overlay();
+    update_pot_motion_vignette(engine, delta);
 
     const auto now = std::chrono::steady_clock::now();
     const auto previous_engine_tick = m_last_engine_tick.load(std::memory_order_relaxed);
@@ -8975,6 +8979,719 @@ void VR::dump_scene_tree_to_file() {
     }
 }
 
+std::vector<SidebarEntryInfo> VR::get_sidebar_entries() {
+    std::vector<SidebarEntryInfo> entries{
+        {"Runtime", false},
+        {"Unreal", false},
+        {"Input", false},
+        {"Camera", false},
+        {"Keybinds", false},
+        {"Console/CVars", true},
+        {"Compatibility", true},
+        {"Debug", true},
+    };
+
+    if (is_path_of_titans_executable()) {
+        entries.emplace_back("Path of Titans", false);
+    }
+
+    return entries;
+}
+
+void VR::update_pot_motion_vignette(sdk::UGameEngine* engine, float delta) {
+    if (!is_path_of_titans_executable()) {
+        return;
+    }
+
+    if (!m_pot_motion_vignette_enabled->value()) {
+        if (m_pot_motion_written_alpha != 0.0f) {
+            m_pot_motion_alpha = 0.0f;
+            m_pot_motion_written_alpha = 0.0f;
+            m_pot_motion_last_time = {};
+            m_pot_motion_avg_ptr = 0;
+            m_pot_motion_avg_count = 0;
+            m_overlay_component.set_pot_vignette_alpha(vrmod::OverlayComponent::POT_VIGNETTE_SLOT_MOTION, 0.0f);
+        }
+
+        return;
+    }
+
+    double pitch = 0.0;
+    double yaw = 0.0;
+    float speed = 0.0f;
+    const auto now = std::chrono::steady_clock::now();
+
+    // GetCameraRotation is BlueprintCallable; UE5's FRotator marshals as three
+    // doubles in the params buffer. This is the true final view rotation, so it
+    // captures every boom swing when the dino turns (the verified nausea source).
+    const auto read_camera_rotation = [](sdk::UObject* pcm, double& pitch_out, double& yaw_out) -> bool {
+        if (pcm == nullptr) {
+            return false;
+        }
+
+        uint8_t params[48]{};
+
+        try {
+            pcm->call_function(L"GetCameraRotation", params);
+        } catch (...) {
+            return false;
+        }
+
+        const auto rot = (const double*)params;
+
+        if (!std::isfinite(rot[0]) || !std::isfinite(rot[1])) {
+            return false;
+        }
+
+        pitch_out = rot[0];
+        yaw_out = rot[1];
+        return true;
+    };
+
+    const auto pcm = (sdk::UObject*)get_primary_player_camera_manager(engine);
+    const bool have_rotation = read_camera_rotation(pcm, pitch, yaw);
+
+    if (have_rotation) {
+        if (m_pot_motion_last_time.time_since_epoch().count() != 0) {
+            const auto dt = std::chrono::duration<double>(now - m_pot_motion_last_time).count();
+
+            if (dt > 0.0001 && dt < 0.5) {
+                const auto wrap = [](double angle) {
+                    while (angle > 180.0) { angle -= 360.0; }
+                    while (angle < -180.0) { angle += 360.0; }
+                    return angle;
+                };
+
+                const auto dyaw = wrap(yaw - m_pot_motion_last_yaw) / dt;
+                const auto dpitch = wrap(pitch - m_pot_motion_last_pitch) / dt;
+                speed = (float)std::sqrt(dyaw * dyaw + dpitch * dpitch);
+            }
+        }
+
+        m_pot_motion_last_yaw = yaw;
+        m_pot_motion_last_pitch = pitch;
+        m_pot_motion_last_time = now;
+    } else {
+        m_pot_motion_last_time = {};
+    }
+
+    const auto base = m_pot_motion_base->value();
+    const auto peak = m_pot_motion_peak->value();
+    const auto threshold = m_pot_motion_threshold->value();
+    const auto max_speed = m_pot_motion_max_speed->value();
+    const auto smoothing = m_pot_motion_smoothing->value();
+    const auto window = (size_t)std::clamp((int)m_pot_motion_avg_window->value(), 1, 16);
+
+    auto target = base;
+
+    if (speed > threshold) {
+        auto t = (speed - threshold) / std::max(max_speed - threshold, 1.0f);
+        t = std::clamp(t, 0.0f, 1.0f);
+        target = base + (peak - base) * t;
+    }
+
+    // Ring-buffer average kills single-frame steps from camera quantization.
+    if (m_pot_motion_avg_ptr >= window) {
+        m_pot_motion_avg_ptr = 0;
+    }
+    m_pot_motion_avg_buf[m_pot_motion_avg_ptr] = target;
+    m_pot_motion_avg_ptr = (m_pot_motion_avg_ptr + 1) % window;
+    m_pot_motion_avg_count = std::min(m_pot_motion_avg_count + 1, window);
+
+    float sum = 0.0f;
+    for (size_t i = 0; i < m_pot_motion_avg_count; ++i) {
+        sum += m_pot_motion_avg_buf[i];
+    }
+
+    if (m_pot_motion_avg_count > 0) {
+        target = sum / (float)m_pot_motion_avg_count;
+    }
+
+    // Exponential smoothing toward the averaged target.
+    const auto a = std::min(smoothing * std::max(delta, 0.0001f), 1.0f);
+    m_pot_motion_alpha += (target - m_pot_motion_alpha) * a;
+
+    if (std::abs(m_pot_motion_alpha - m_pot_motion_written_alpha) > 0.001f) {
+        m_pot_motion_written_alpha = m_pot_motion_alpha;
+        m_overlay_component.set_pot_vignette_alpha(vrmod::OverlayComponent::POT_VIGNETTE_SLOT_MOTION, m_pot_motion_alpha);
+    }
+}
+
+// Finds the dynamic material instance used by a UImage brush
+// (WidgetStyle -> ResourceObject), if any. Offsets resolved once via
+// reflection against the widget's own class.
+static sdk::UObjectBase* pot_get_brush_material(sdk::UObjectBase* image_object) {
+    static uint32_t resource_offset{0xFFFFFFFF};
+    static bool attempted{false};
+
+    const auto brush = (const uint8_t*)((sdk::UObject*)image_object)->get_property_data(L"WidgetStyle");
+
+    if (brush == nullptr) {
+        return nullptr;
+    }
+
+    if (!attempted) {
+        attempted = true;
+
+        const auto cls = image_object->get_class();
+        const auto style_prop = cls != nullptr ? cls->find_property(L"WidgetStyle") : nullptr;
+        const auto style_struct = style_prop != nullptr ? ((sdk::FStructProperty*)style_prop)->get_struct() : nullptr;
+        const auto res_prop = style_struct != nullptr ? style_struct->find_property(L"ResourceObject") : nullptr;
+
+        if (res_prop != nullptr) {
+            resource_offset = (uint32_t)res_prop->get_offset();
+            spdlog::info("[PoT][DamageMat] WidgetStyle.ResourceObject offset={}", resource_offset);
+        } else {
+            spdlog::info("[PoT][DamageMat] WidgetStyle.ResourceObject not found via reflection");
+        }
+    }
+
+    if (resource_offset == 0xFFFFFFFF || IsBadReadPtr(brush + resource_offset, sizeof(void*))) {
+        return nullptr;
+    }
+
+    auto* resource = *(sdk::UObjectBase**)(brush + resource_offset);
+
+    if (resource == nullptr || IsBadReadPtr(resource, sizeof(void*) * 4)) {
+        return nullptr;
+    }
+
+    const auto rcls = resource->get_class();
+
+    if (rcls == nullptr) {
+        return nullptr;
+    }
+
+    for (auto* s = (sdk::UStruct*)rcls; s != nullptr; s = s->get_super_struct()) {
+        if (s->get_name_safe().find(L"MaterialInstanceDynamic") != std::wstring::npos) {
+            return resource;
+        }
+    }
+
+    return nullptr;
+}
+
+void VR::rebuild_pot_damage_watch(sdk::FUObjectArray* object_array) {
+    m_pot_damage_watch.clear();
+
+    if (object_array == nullptr) {
+        return;
+    }
+
+    const auto collect = [&](sdk::UObjectBase* object, uint32_t index, int32_t serial, const char* suffix) {
+        if (object == nullptr) {
+            return;
+        }
+
+        const auto cls = object->get_class();
+
+        if (cls == nullptr || IsBadReadPtr(cls, sizeof(void*) * 4)) {
+            return;
+        }
+
+        PotWatchedWidget widget;
+        widget.object = object;
+        widget.index = index;
+        widget.serial = serial;
+        widget.label = std::format("{}{}", utility::narrow(cls->get_name_safe()), suffix);
+
+        for (auto* s = (sdk::UStruct*)cls; s != nullptr; s = s->get_super_struct()) {
+            auto* field = s->get_child_properties();
+            auto count = 0;
+
+            for (; field != nullptr; field = field->get_next()) {
+                if (++count > 1024 || widget.props.size() >= 512) {
+                    break;
+                }
+
+                std::wstring type_name;
+
+                if (const auto fcls = field->get_class(); fcls != nullptr) {
+                    type_name = fcls->get_name().to_string();
+                }
+
+                uint8_t type = 0xFF;
+
+                if (type_name == L"FloatProperty") {
+                    type = 0;
+                } else if (type_name == L"DoubleProperty") {
+                    type = 1;
+                } else if (type_name == L"BoolProperty") {
+                    type = 2;
+                } else if (type_name == L"IntProperty") {
+                    type = 3;
+                } else {
+                    continue;
+                }
+
+                const auto prop = (sdk::FProperty*)field;
+
+                widget.props.push_back(PotWatchedProperty{
+                    (uint32_t)prop->get_offset(),
+                    type,
+                    utility::narrow(field->get_field_name().to_string()),
+                });
+            }
+        }
+
+        if (!widget.props.empty()) {
+            m_pot_damage_watch.push_back(std::move(widget));
+        }
+    };
+
+    for (const auto& entry : m_pot_hidden_damage_widgets) {
+        collect(entry.object, entry.index, entry.serial, " (DamageImage)");
+    }
+
+    for (const auto& entry : m_pot_damage_owner_widgets) {
+        collect(entry.object, entry.index, entry.serial, " (owner)");
+    }
+
+    // Brush material parameter watches: the flash lives in the MID parameter
+    // arrays, so resolve their layout once here and log every value change.
+    m_pot_damage_material_watch.clear();
+
+    const auto attach = [&](sdk::UObjectBase* widget_object, uint8_t slot, const char* via) {
+        const auto mid = pot_get_brush_material(widget_object);
+
+        if (mid == nullptr) {
+            return;
+        }
+
+        const auto mid_index = mid->get_internal_index();
+        const auto item = object_array->get_object(static_cast<int32_t>(mid_index));
+
+        if (item == nullptr || item->get_object() != mid) {
+            return;
+        }
+
+        const auto mid_cls = mid->get_class();
+
+        if (mid_cls == nullptr || IsBadReadPtr(mid_cls, sizeof(void*) * 4)) {
+            return;
+        }
+
+        const auto mid_name = utility::narrow(mid->get_name_safe());
+
+        const auto add_array_watch = [&](const wchar_t* prop_name, bool is_vector) {
+            sdk::FProperty* array_prop = nullptr;
+
+            for (auto* s = (sdk::UStruct*)mid_cls; s != nullptr && array_prop == nullptr; s = s->get_super_struct()) {
+                array_prop = s->find_property(prop_name);
+            }
+
+            const auto array_typed = (sdk::FArrayProperty*)array_prop;
+
+            if (array_typed == nullptr) {
+                return;
+            }
+
+            const auto inner = array_typed->get_inner();
+            const auto inner_struct_prop = (sdk::FStructProperty*)inner;
+            const auto elem_struct = inner_struct_prop != nullptr ? inner_struct_prop->get_struct() : nullptr;
+
+            if (elem_struct == nullptr || IsBadReadPtr(elem_struct, sizeof(void*) * 4)) {
+                return;
+            }
+
+            sdk::FProperty* value_prop = nullptr;
+
+            for (auto* s = (sdk::UStruct*)elem_struct; s != nullptr && value_prop == nullptr; s = s->get_super_struct()) {
+                value_prop = s->find_property(L"Value");
+            }
+
+            const auto stride = (uint32_t)elem_struct->get_struct_size();
+
+            if (value_prop == nullptr || stride == 0 || stride > 256) {
+                return;
+            }
+
+            PotMaterialWatch watch;
+            watch.mid = mid;
+            watch.index = mid_index;
+            watch.serial = item->get_serial_number();
+            watch.slot = slot;
+            watch.array_offset = (uint32_t)array_typed->get_offset();
+            watch.stride = stride;
+            watch.value_offset = (uint32_t)value_prop->get_offset();
+            watch.is_vector = is_vector;
+            watch.label = std::format("{}.{}<{}>", mid_name, utility::narrow(std::wstring(prop_name)), via);
+
+            m_pot_damage_material_watch.push_back(std::move(watch));
+        };
+
+        add_array_watch(L"ScalarParameterValues", false);
+        add_array_watch(L"VectorParameterValues", true);
+    };
+
+    for (const auto& entry : m_pot_hidden_damage_widgets) {
+        attach(entry.object, entry.slot, "image");
+    }
+
+    spdlog::info("[PoT][DamageWatch] watching {} widgets, {} material parameter arrays",
+        m_pot_damage_watch.size(), m_pot_damage_material_watch.size());
+}
+
+void VR::log_pot_damage_watch_changes(sdk::FUObjectArray* object_array) {
+    if (object_array == nullptr) {
+        return;
+    }
+
+    m_pot_damage_mat_signal = {};
+
+    for (auto& widget : m_pot_damage_watch) {
+        const auto item = object_array->get_object(static_cast<int32_t>(widget.index));
+
+        if (item == nullptr || item->get_object() != widget.object || item->get_serial_number() != widget.serial) {
+            continue;
+        }
+
+        for (auto& prop : widget.props) {
+            const auto addr = (uintptr_t)widget.object + (uintptr_t)prop.offset;
+
+            if (IsBadReadPtr((void*)addr, sizeof(double))) {
+                continue;
+            }
+
+            double cur = 0.0;
+
+            switch (prop.type) {
+            case 0: cur = *(const float*)addr; break;
+            case 1: cur = *(const double*)addr; break;
+            case 2: cur = *(const uint8_t*)addr; break;
+            case 3: cur = *(const int32_t*)addr; break;
+            }
+
+            if (!std::isfinite(cur)) {
+                continue;
+            }
+
+            if (!prop.has_last) {
+                prop.last = cur;
+                prop.has_last = true;
+                continue;
+            }
+
+            const auto epsilon = (prop.type == 2 || prop.type == 3) ? 0.5 : 0.02;
+
+            if (std::abs(cur - prop.last) >= epsilon) {
+                spdlog::info("[PoT][DamageWatch] {}.{}: {:.3f} -> {:.3f}", widget.label, prop.name, prop.last, cur);
+                prop.last = cur;
+            }
+        }
+    }
+
+    // Brush material parameters: log every parameter as it is first seen and
+    // on each change, and drive the slot signal from opacity/alpha-named ones.
+    for (auto& watch : m_pot_damage_material_watch) {
+        const auto item = object_array->get_object(static_cast<int32_t>(watch.index));
+
+        if (item == nullptr || item->get_object() != watch.mid || item->get_serial_number() != watch.serial) {
+            continue;
+        }
+
+        const auto arr_addr = (uintptr_t)watch.mid + (uintptr_t)watch.array_offset;
+
+        if (IsBadReadPtr((void*)arr_addr, sizeof(void*) + sizeof(int32_t))) {
+            continue;
+        }
+
+        const auto data = *(void* const*)arr_addr;
+        const auto num = *(const int32_t*)(arr_addr + sizeof(void*));
+
+        if (data == nullptr || num <= 0 || num > 4096) {
+            continue;
+        }
+
+        if (IsBadReadPtr(data, (size_t)num * (size_t)watch.stride)) {
+            continue;
+        }
+
+        for (auto i = 0; i < num; ++i) {
+            const auto elem = (uintptr_t)data + (size_t)i * (size_t)watch.stride;
+
+            std::string param_name;
+
+            {
+                const auto fname = *(const sdk::FName*)elem;
+                param_name = utility::narrow(fname.to_string());
+            }
+
+            if (param_name.empty()) {
+                continue;
+            }
+
+            double cur = 0.0;
+            float r = 0.f, g = 0.f, b = 0.f;
+
+            if (watch.is_vector) {
+                if (IsBadReadPtr((void*)(elem + watch.value_offset), sizeof(float) * 4)) {
+                    continue;
+                }
+
+                const auto c = (const float*)(elem + watch.value_offset);
+                r = c[0];
+                g = c[1];
+                b = c[2];
+                cur = c[3];
+            } else {
+                if (IsBadReadPtr((void*)(elem + watch.value_offset), sizeof(float))) {
+                    continue;
+                }
+
+                cur = *(const float*)(elem + watch.value_offset);
+            }
+
+            if (!std::isfinite(cur)) {
+                continue;
+            }
+
+            const auto seen = watch.last_values.find(param_name);
+
+            if (seen == watch.last_values.end()) {
+                watch.last_values.emplace(param_name, cur);
+
+                if (watch.is_vector) {
+                    spdlog::info("[PoT][DamageMat] {}.{} = a{:.3f} (rgb {:.2f} {:.2f} {:.2f})", watch.label, param_name, cur, r, g, b);
+                } else {
+                    spdlog::info("[PoT][DamageMat] {}.{} = {:.3f}", watch.label, param_name, cur);
+                }
+            } else if (std::abs(cur - seen->second) >= 0.01) {
+                if (watch.is_vector) {
+                    spdlog::info("[PoT][DamageWatch] {}.{}: a{:.3f} -> a{:.3f} (rgb {:.2f} {:.2f} {:.2f})", watch.label, param_name, seen->second, cur, r, g, b);
+                } else {
+                    spdlog::info("[PoT][DamageWatch] {}.{}: {:.3f} -> {:.3f}", watch.label, param_name, seen->second, cur);
+                }
+
+                seen->second = cur;
+            }
+
+            std::string lowered = param_name;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+
+            if (lowered.find("opac") != std::string::npos || lowered.find("alpha") != std::string::npos) {
+                const auto slot = std::min((uint32_t)watch.slot, 2u);
+                m_pot_damage_mat_signal[slot] = std::max(m_pot_damage_mat_signal[slot], std::clamp((float)cur, 0.0f, 1.0f));
+            }
+        }
+    }
+}
+
+static std::string pot_property_value_string(sdk::FProperty* prop, sdk::UObjectBase* object, std::wstring_view type_name) {
+    try {
+        const auto addr = (uintptr_t)object + (uintptr_t)prop->get_offset();
+
+        if (type_name == L"FloatProperty" && !IsBadReadPtr((void*)addr, sizeof(float))) {
+            const auto v = *(const float*)addr;
+            return std::isfinite(v) ? std::format("{:.4f}", v) : "nan";
+        }
+
+        if (type_name == L"DoubleProperty" && !IsBadReadPtr((void*)addr, sizeof(double))) {
+            const auto v = *(const double*)addr;
+            return std::isfinite(v) ? std::format("{:.4f}", v) : "nan";
+        }
+
+        if (type_name == L"BoolProperty" && !IsBadReadPtr((void*)addr, sizeof(uint8_t))) {
+            return std::format("byte=0x{:02X}", *(const uint8_t*)addr);
+        }
+
+        if (type_name == L"ByteProperty" && !IsBadReadPtr((void*)addr, sizeof(uint8_t))) {
+            return std::format("byte={}", (uint32_t)*(const uint8_t*)addr);
+        }
+
+        if (type_name == L"IntProperty" && !IsBadReadPtr((void*)addr, sizeof(int32_t))) {
+            return std::to_string(*(const int32_t*)addr);
+        }
+
+        if (type_name == L"Int64Property" && !IsBadReadPtr((void*)addr, sizeof(int64_t))) {
+            return std::to_string(*(const int64_t*)addr);
+        }
+
+        if ((type_name == L"ObjectProperty" || type_name == L"SoftObjectProperty" || type_name == L"InterfaceProperty")
+            && !IsBadReadPtr((void*)addr, sizeof(void*))) {
+            const auto ptr = *(void* const*)addr;
+
+            if (ptr == nullptr) {
+                return "null";
+            }
+
+            const auto as_object = (sdk::UObjectBase*)ptr;
+
+            if (IsBadReadPtr(as_object, sizeof(void*) * 4)) {
+                return "opaque";
+            }
+
+            const auto cls = as_object->get_class();
+
+            return std::format("{} '{}'",
+                cls != nullptr ? utility::narrow(cls->get_name_safe()) : std::string{"?"},
+                utility::narrow(as_object->get_name_safe()));
+        }
+
+        if (type_name == L"StructProperty") {
+            const auto struct_prop = (sdk::FStructProperty*)prop;
+            const auto struct_desc = struct_prop != nullptr ? struct_prop->get_struct() : nullptr;
+
+            return std::format("struct {}",
+                struct_desc != nullptr ? utility::narrow(struct_desc->get_name_safe()) : std::string{"?"});
+        }
+
+        if (type_name == L"ArrayProperty" && !IsBadReadPtr((void*)addr, sizeof(void*) + sizeof(int32_t))) {
+            const auto num = *(const int32_t*)(addr + sizeof(void*));
+            return std::format("array num={}", num);
+        }
+    } catch (...) {
+        return "read-error";
+    }
+
+    return "";
+}
+
+static void pot_dump_object_properties(std::ofstream& file, sdk::UObjectBase* object, const char* role, std::unordered_set<void*>& dumped) {
+    if (object == nullptr || !dumped.insert((void*)object).second) {
+        return;
+    }
+
+    const auto cls = object->get_class();
+
+    if (cls == nullptr || IsBadReadPtr(cls, sizeof(void*) * 4)) {
+        return;
+    }
+
+    file << "--- " << role << ": " << utility::narrow(object->get_full_name())
+         << " (class " << utility::narrow(cls->get_name_safe()) << ")\n";
+
+    auto total = 0;
+
+    for (auto* s = (sdk::UStruct*)cls; s != nullptr; s = s->get_super_struct()) {
+        auto* field = s->get_child_properties();
+        auto count = 0;
+
+        for (; field != nullptr; field = field->get_next()) {
+            if (++count > 1024 || ++total > 4096) {
+                break;
+            }
+
+            const auto prop = (sdk::FProperty*)field;
+
+            std::wstring type_name;
+
+            if (const auto fcls = field->get_class(); fcls != nullptr) {
+                type_name = fcls->get_name().to_string();
+            }
+
+            const auto value = pot_property_value_string(prop, object, type_name);
+
+            file << std::format("  {} :: {} ({}) off=0x{:X} = {}\n",
+                utility::narrow(s->get_name_safe()),
+                utility::narrow(field->get_field_name().to_string()),
+                utility::narrow(type_name),
+                (uint32_t)prop->get_offset(),
+                value);
+        }
+    }
+
+    file << "\n";
+}
+
+void VR::dump_pot_damage_widget_properties() {
+    try {
+        const auto object_array = sdk::FUObjectArray::get();
+
+        if (object_array == nullptr) {
+            spdlog::warn("[PoT][DamageDump] No FUObjectArray");
+            return;
+        }
+
+        if (m_pot_hidden_damage_widgets.empty()) {
+            spdlog::warn("[PoT][DamageDump] No damage widgets tracked yet (enter the world first)");
+            return;
+        }
+
+        const auto dir = Framework::get_persistent_dir();
+
+        // Incrementing dump names: damage_props_001.txt, _002, ...
+        int next_index = 1;
+        std::error_code ec{};
+
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            const auto filename = entry.path().filename().string();
+
+            if (!filename.starts_with("damage_props_") || !filename.ends_with(".txt")) {
+                continue;
+            }
+
+            const auto digits = filename.substr(
+                sizeof("damage_props_") - 1,
+                filename.size() - (sizeof("damage_props_") - 1) - (sizeof(".txt") - 1));
+
+            if (digits.empty() ||
+                !std::all_of(digits.begin(), digits.end(), [](char c) { return std::isdigit((unsigned char)c) != 0; })) {
+                continue;
+            }
+
+            next_index = std::max(next_index, std::stoi(digits) + 1);
+        }
+
+        const auto path = dir / std::format("damage_props_{:03}.txt", next_index);
+
+        std::ofstream file{path};
+
+        if (!file) {
+            spdlog::error("[PoT][DamageDump] Failed to open {} for writing", path.string());
+            return;
+        }
+
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+
+        file << std::format("Damage widget property dump #{} at {:04}-{:02}-{:02} {:02}:{:02}:{:02}\n",
+            next_index, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+        const auto engine = sdk::UGameEngine::get();
+
+        if (engine != nullptr && engine->get_world() != nullptr) {
+            file << "World: " << utility::narrow(engine->get_world()->get_full_name()) << "\n";
+        }
+
+        file << std::format("Mirror state: red op {:.3f} pushed {:.3f} | green op {:.3f} pushed {:.3f} | blue op {:.3f} pushed {:.3f}\n\n",
+            std::max(0.0f, m_pot_damage_last_opacity[0]), std::max(0.0f, m_pot_damage_last_alpha[0]),
+            std::max(0.0f, m_pot_damage_last_opacity[1]), std::max(0.0f, m_pot_damage_last_alpha[1]),
+            std::max(0.0f, m_pot_damage_last_opacity[2]), std::max(0.0f, m_pot_damage_last_alpha[2]));
+
+        std::unordered_set<void*> dumped{};
+
+        for (const auto& entry : m_pot_hidden_damage_widgets) {
+            const auto item = object_array->get_object(static_cast<int32_t>(entry.index));
+
+            if (item == nullptr || item->get_object() != entry.object || item->get_serial_number() != entry.serial) {
+                continue;
+            }
+
+            pot_dump_object_properties(file, entry.object, "image", dumped);
+        }
+
+        for (const auto& entry : m_pot_damage_owner_widgets) {
+            const auto item = object_array->get_object(static_cast<int32_t>(entry.index));
+
+            if (item == nullptr || item->get_object() != entry.object || item->get_serial_number() != entry.serial) {
+                continue;
+            }
+
+            pot_dump_object_properties(file, entry.object, "owner", dumped);
+        }
+
+        file << "=== end of dump #" << next_index << " ===\n";
+        file.flush();
+
+        spdlog::info("[PoT][DamageDump] Wrote dump #{} ({} objects) to {}", next_index, dumped.size(), path.string());
+    } catch (const std::exception& e) {
+        spdlog::error("[PoT][DamageDump] Failed: {}", e.what());
+    } catch (...) {
+        spdlog::error("[PoT][DamageDump] Failed: unknown exception");
+    }
+}
+
 void VR::update_pot_damage_overlay() {
     if (!is_path_of_titans_executable()) {
         return;
@@ -9017,7 +9734,19 @@ void VR::update_pot_damage_overlay() {
                 continue;
             }
 
-            if (object->get_name_safe() != L"DamageImage") {
+            const auto short_name = object->get_name_safe();
+            const bool is_damage_image = (short_name == L"DamageImage");
+
+            std::wstring lowered_short = short_name;
+            std::transform(lowered_short.begin(), lowered_short.end(), lowered_short.begin(), [](wchar_t c) {
+                return static_cast<wchar_t>(std::towlower(c));
+            });
+
+            const bool damage_candidate = is_damage_image
+                || lowered_short.find(L"damage") != std::wstring::npos
+                || lowered_short.find(L"vignette") != std::wstring::npos;
+
+            if (!damage_candidate) {
                 continue;
             }
 
@@ -9025,6 +9754,14 @@ void VR::update_pot_damage_overlay() {
 
             if (full_name.find(L"Default__") != std::wstring::npos) {
                 // Class default object: template state, not live UI.
+                continue;
+            }
+
+            if (full_name.find(L"/Engine/Transient") == std::wstring::npos) {
+                // Archived .uasset widget trees (e.g. /Game/UI/Menu/HealthBlood/...)
+                // are never drawn and hold RenderOpacity at a permanent 1.0;
+                // including them stuck the mirror on. Live instances live in the
+                // transient package only.
                 continue;
             }
 
@@ -9044,6 +9781,32 @@ void VR::update_pot_damage_overlay() {
                 continue;
             }
 
+            float opacity = 0.0f;
+            const auto opacity_ptr = ((sdk::UObject*)object)->get_property_data(L"RenderOpacity");
+
+            if (opacity_ptr != nullptr && !IsBadReadPtr(opacity_ptr, sizeof(float))) {
+                opacity = *(const float*)opacity_ptr;
+
+                if (!std::isfinite(opacity)) {
+                    opacity = 0.0f;
+                }
+            }
+
+            // Discovery: PoT's green/blue damage carriers are not named yet.
+            // Log any active damage/vignette-like widget once so a play session
+            // can map them to the green/blue mirror slots.
+            if (!is_damage_image && opacity > 0.01f && m_pot_damage_discovery_logged.size() < 128
+                && m_pot_damage_discovery_logged.insert((void*)object).second) {
+                spdlog::info("[PoT][VignetteDiscovery] active damage-like widget '{}' (class '{}') opacity={:.3f}",
+                    utility::narrow(full_name),
+                    utility::narrow(klass != nullptr ? klass->get_name_safe() : L"?"),
+                    opacity);
+            }
+
+            if (!is_damage_image) {
+                continue;
+            }
+
             constexpr uint8_t hidden_mode = 2; // EVisibility::Hidden
 
             const auto visibility = ((sdk::UObject*)object)->get_property_data(L"Visibility");
@@ -9056,13 +9819,71 @@ void VR::update_pot_damage_overlay() {
                 [object](const auto& entry) { return entry.object == object; });
 
             if (!tracked) {
+                // PoT's damage overlays all name their image "DamageImage"; the
+                // damage type lives in the owning widget: HealthBlood (red),
+                // Poison (green), Venom (blue). Verified from live widget captures.
+                auto slot = static_cast<uint8_t>(vrmod::OverlayComponent::POT_VIGNETTE_SLOT_RED);
+
+                if (full_name.find(L"BP_UMG_Poison") != std::wstring::npos) {
+                    slot = static_cast<uint8_t>(vrmod::OverlayComponent::POT_VIGNETTE_SLOT_GREEN);
+                } else if (full_name.find(L"BP_UMG_Venom") != std::wstring::npos) {
+                    slot = static_cast<uint8_t>(vrmod::OverlayComponent::POT_VIGNETTE_SLOT_BLUE);
+                }
+
                 m_pot_hidden_damage_widgets.push_back(PotHiddenWidget{
                     object,
                     i,
                     item->get_serial_number(),
+                    slot,
                 });
 
-                spdlog::info("[PoT][DamageOverlay] Hiding blood damage widget '{}'", utility::narrow(full_name));
+                spdlog::info("[PoT][DamageOverlay] Hiding damage overlay widget '{}' -> vignette slot {}",
+                    utility::narrow(full_name), (uint32_t)slot);
+
+                // The user-observed damage alpha is set on the owning
+                // BP_UMG_HealthBlood/Poison/Venom widget; mirror and watch it too.
+                sdk::UObjectBase* owner = nullptr;
+                auto outer = object->get_outer();
+
+                for (auto depth = 0; outer != nullptr && depth < 8; ++depth) {
+                    const auto outer_cls = outer->get_class();
+
+                    if (outer_cls == nullptr || IsBadReadPtr(outer_cls, sizeof(void*) * 4)) {
+                        break;
+                    }
+
+                    const auto outer_name = outer->get_full_name();
+
+                    if (outer_name.find(L"/Engine/Transient") != std::wstring::npos
+                        && outer_cls->get_name_safe().find(L"BP_UMG_") != std::wstring::npos) {
+                        owner = outer;
+                        break;
+                    }
+
+                    outer = outer->get_outer();
+                }
+
+                if (owner != nullptr) {
+                    const bool owner_known = std::any_of(m_pot_damage_owner_widgets.begin(), m_pot_damage_owner_widgets.end(),
+                        [owner](const auto& entry) { return entry.object == owner; });
+
+                    if (!owner_known) {
+                        const auto owner_index = owner->get_internal_index();
+                        const auto owner_item = object_array->get_object(static_cast<int32_t>(owner_index));
+
+                        if (owner_item != nullptr && owner_item->get_object() == owner) {
+                            m_pot_damage_owner_widgets.push_back(PotHiddenWidget{
+                                owner,
+                                owner_index,
+                                owner_item->get_serial_number(),
+                                slot,
+                            });
+
+                            spdlog::info("[PoT][DamageOverlay] Mirroring owner widget '{}' -> vignette slot {}",
+                                utility::narrow(owner->get_full_name()), (uint32_t)slot);
+                        }
+                    }
+                }
             }
 
             object->call_function(L"SetVisibility", (void*)&hidden_mode);
@@ -9072,6 +9893,116 @@ void VR::update_pot_damage_overlay() {
     }
 
     m_pot_damage_overlay_scan_cursor = end >= static_cast<uint32_t>(object_count) ? 0 : end;
+
+    // Feed every live damage widget's RenderOpacity (image + owning BP_UMG_
+    // effect widget) straight into its head-locked vignette slot. The game
+    // animates the opacity itself, so no smoothing/decay layer is applied.
+    if (m_pot_damage_vignette_enabled->value()) {
+        std::array<float, 3> max_opacity{{0.0f, 0.0f, 0.0f}};
+        std::array<size_t, 3> live_count{{0, 0, 0}};
+        size_t stale_count = 0;
+
+        const auto consider = [&](PotHiddenWidget& entry) {
+            const auto item = object_array->get_object(static_cast<int32_t>(entry.index));
+
+            if (item == nullptr || item->get_object() != entry.object || item->get_serial_number() != entry.serial) {
+                ++stale_count;
+                return;
+            }
+
+            const auto opacity_ptr = ((sdk::UObject*)entry.object)->get_property_data(L"RenderOpacity");
+
+            if (opacity_ptr == nullptr || IsBadReadPtr(opacity_ptr, sizeof(float))) {
+                return;
+            }
+
+            const auto opacity = *(const float*)opacity_ptr;
+
+            if (!std::isfinite(opacity)) {
+                return;
+            }
+
+            const auto slot = std::min((uint32_t)entry.slot, 2u);
+
+            ++live_count[slot];
+            max_opacity[slot] = std::max(max_opacity[slot], opacity);
+        };
+
+        for (auto& entry : m_pot_hidden_damage_widgets) {
+            consider(entry);
+        }
+
+        for (auto& entry : m_pot_damage_owner_widgets) {
+            consider(entry);
+        }
+
+        // Once every tracked entry is recycled (map reload), drop the set and
+        // let the rolling sweep rediscover the new instances.
+        if (stale_count > 0 && stale_count >= m_pot_hidden_damage_widgets.size() + m_pot_damage_owner_widgets.size()) {
+            m_pot_hidden_damage_widgets.clear();
+            m_pot_damage_owner_widgets.clear();
+        }
+
+        const auto scale = m_pot_damage_vignette_scale->value();
+        const int slots[3] = {
+            vrmod::OverlayComponent::POT_VIGNETTE_SLOT_RED,
+            vrmod::OverlayComponent::POT_VIGNETTE_SLOT_GREEN,
+            vrmod::OverlayComponent::POT_VIGNETTE_SLOT_BLUE,
+        };
+
+        // Property/material watcher (also updates m_pot_damage_mat_signal).
+        const auto total_tracked = m_pot_hidden_damage_widgets.size() + m_pot_damage_owner_widgets.size();
+
+        if (total_tracked != m_pot_damage_watch_build_count) {
+            m_pot_damage_watch_build_count = total_tracked;
+            rebuild_pot_damage_watch(object_array);
+        }
+
+        log_pot_damage_watch_changes(object_array);
+
+        // The vignette is driven by the brush material's opacity parameters.
+        // RenderOpacity is kept for display only: every live widget sits at a
+        // permanent 1.0 and is useless as a signal.
+        for (auto s = 0u; s < 3u; ++s) {
+            if (live_count[s] > 0) {
+                m_pot_damage_last_opacity[s] = max_opacity[s];
+            }
+
+            const auto alpha = std::clamp(m_pot_damage_mat_signal[s] * scale, 0.0f, 4.0f);
+
+            if (std::abs(alpha - m_pot_damage_last_alpha[s]) > 0.002f) {
+                m_pot_damage_last_alpha[s] = alpha;
+                m_overlay_component.set_pot_vignette_alpha(slots[s], alpha);
+            }
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+
+        if (m_pot_damage_debug_log_time.time_since_epoch().count() == 0 || now - m_pot_damage_debug_log_time >= std::chrono::seconds(5)) {
+            m_pot_damage_debug_log_time = now;
+            spdlog::info("[PoT][DamageVignette] mat signal: red {:.3f} | green {:.3f} | blue {:.3f} | pushed {:.3f} {:.3f} {:.3f} | material watches {}",
+                m_pot_damage_mat_signal[0], m_pot_damage_mat_signal[1], m_pot_damage_mat_signal[2],
+                std::max(0.0f, m_pot_damage_last_alpha[0]),
+                std::max(0.0f, m_pot_damage_last_alpha[1]),
+                std::max(0.0f, m_pot_damage_last_alpha[2]),
+                m_pot_damage_material_watch.size());
+        }
+    } else {
+        m_pot_damage_owner_widgets.clear();
+        m_pot_damage_watch.clear();
+        m_pot_damage_material_watch.clear();
+        m_pot_damage_watch_build_count = 0;
+        m_pot_damage_mat_signal = {};
+
+        for (auto s = 0u; s < 3u; ++s) {
+            m_pot_damage_last_opacity[s] = -1.0f;
+
+            if (m_pot_damage_last_alpha[s] != 0.0f) {
+                m_pot_damage_last_alpha[s] = 0.0f;
+                m_overlay_component.set_pot_vignette_alpha(vrmod::OverlayComponent::POT_VIGNETTE_SLOT_RED + static_cast<int>(s), 0.0f);
+            }
+        }
+    }
 }
 
 void VR::on_draw_sidebar_entry(std::string_view name) {
@@ -9097,6 +10028,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         PAGE_CONSOLE,
         PAGE_COMPATIBILITY,
         PAGE_DEBUG,
+        PAGE_POT,
     };
 
     SelectedPage selected_page = PAGE_RUNTIME;
@@ -9162,6 +10094,9 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         break;
     case "Debug"_fnv:
         selected_page = PAGE_DEBUG;
+        break;
+    case "Path of Titans"_fnv:
+        selected_page = PAGE_POT;
         break;
     default:
         ImGui::Text("Unknown page selected");
@@ -10052,6 +10987,50 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             ImGui::SameLine();
             ImGui::TextWrapped("Writes scene_tree_NNN.txt to the UEVR game folder (%%APPDATA%%\\UnrealVRMod\\<exe>)");
         }
+    }
+
+    if (selected_page == PAGE_POT) {
+        m_overlay_component.draw_pot_vignette_ui();
+
+        ImGui::Separator();
+        m_pot_damage_vignette_enabled->draw("Mirror Damage Vignettes");
+        if (m_pot_damage_vignette_enabled->value()) {
+            m_pot_damage_vignette_scale->draw("Damage Intensity Scale");
+        }
+
+        if (ImGui::Button("Dump Damage Widget Properties")) {
+            dump_pot_damage_widget_properties();
+        }
+
+        ImGui::SameLine();
+        ImGui::TextWrapped("Writes damage_props_NNN.txt: capture once with no damage, again while damaged, then diff.");
+
+        m_pot_motion_vignette_enabled->draw("Vignette On Camera Rotation");
+        if (m_pot_motion_vignette_enabled->value()) {
+            ImGui::Indent();
+            m_pot_motion_base->draw("Base (resting)");
+            m_pot_motion_peak->draw("Peak (full close-in)");
+            m_pot_motion_threshold->draw("Threshold (deg/sec)");
+            m_pot_motion_max_speed->draw("Max Speed (deg/sec)");
+            m_pot_motion_smoothing->draw("Smoothing");
+            m_pot_motion_avg_window->draw("Averaging Window (frames)");
+            ImGui::Unindent();
+        }
+
+        ImGui::TextWrapped("Pushed alphas: red %.2f | green %.2f | blue %.2f | motion %.2f (smoothed %.2f)",
+            std::max(0.0f, m_pot_damage_last_alpha[0]),
+            std::max(0.0f, m_pot_damage_last_alpha[1]),
+            std::max(0.0f, m_pot_damage_last_alpha[2]),
+            m_pot_motion_written_alpha, m_pot_motion_alpha);
+        ImGui::TextWrapped("Material opacity signal: red %.3f | green %.3f | blue %.3f",
+            m_pot_damage_mat_signal[0],
+            m_pot_damage_mat_signal[1],
+            m_pot_damage_mat_signal[2]);
+        ImGui::TextWrapped("RenderOpacity (display only, stuck at 1.0 in PoT): red %.3f | green %.3f | blue %.3f",
+            std::max(0.0f, m_pot_damage_last_opacity[0]),
+            std::max(0.0f, m_pot_damage_last_opacity[1]),
+            std::max(0.0f, m_pot_damage_last_opacity[2]));
+        ImGui::TextWrapped("Red/green/blue mirror the HealthBlood/Poison/Venom brush material; parameter changes are logged to log.txt.");
     }
 
     ImGui::EndGroup();

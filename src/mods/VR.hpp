@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <sdk/Math.hpp>
+#include <sdk/UObjectArray.hpp>
 
 #include "vr/runtimes/OpenVR.hpp"
 #include "vr/runtimes/OpenXR.hpp"
@@ -139,18 +140,7 @@ public:
         return clean_initialize();
     }
 
-    std::vector<SidebarEntryInfo> get_sidebar_entries() override {
-        return {
-            {"Runtime", false},
-            {"Unreal", false},
-            {"Input", false},
-            {"Camera", false},
-            {"Keybinds", false},
-            {"Console/CVars", true},
-            {"Compatibility", true},
-            {"Debug", true},
-        };
-    }
+    std::vector<SidebarEntryInfo> get_sidebar_entries() override;
 
     // texture bounds to tell OpenVR which parts of the submitted texture to render (default - use the whole texture).
     // Will be modified to accommodate forced symmetrical eye projection
@@ -208,6 +198,19 @@ public:
     // flat-screen rectangle inside the stereo view. Hide it unconditionally for
     // this title, like the legacy Lua script did.
     void update_pot_damage_overlay();
+
+    // Debug: log every reflected property (name, type, offset, current value
+    // where readable) of each tracked DamageImage widget and its owning
+    // BP_UMG_* UserWidget so the real damage-trigger variable can be found.
+    void dump_pot_damage_widget_properties();
+
+    void rebuild_pot_damage_watch(sdk::FUObjectArray* object_array);
+    void log_pot_damage_watch_changes(sdk::FUObjectArray* object_array);
+
+    // Motion vignette: ramps a head-locked vignette overlay with the game
+    // camera's angular speed (the boom swing, not the HMD - the nausea source
+    // verified in the Lua research phase).
+    void update_pot_motion_vignette(sdk::UGameEngine* engine, float delta);
 
     void reinitialize_renderer() {
         if (m_is_d3d12) {
@@ -1444,6 +1447,15 @@ private:
 
     const ModCombo::Ptr m_rendering_method{ ModCombo::create(generate_name("RenderingMethod"), s_rendering_method_names) };
     const ModCombo::Ptr m_synced_afr_method{ ModCombo::create(generate_name("SyncedSequentialMethod"), s_synced_afr_method_names, 1) };
+    const ModToggle::Ptr m_pot_damage_vignette_enabled{ ModToggle::create(generate_name("PotDamageVignette"), true) };
+    const ModSlider::Ptr m_pot_damage_vignette_scale{ ModSlider::create(generate_name("PotDamageVignetteScale"), 0.0f, 4.0f, 1.0f) };
+    const ModToggle::Ptr m_pot_motion_vignette_enabled{ ModToggle::create(generate_name("PotMotionVignette"), true) };
+    const ModSlider::Ptr m_pot_motion_base{ ModSlider::create(generate_name("PotMotionBase"), 0.0f, 4.0f, 0.0f) };
+    const ModSlider::Ptr m_pot_motion_peak{ ModSlider::create(generate_name("PotMotionPeak"), 0.0f, 8.0f, 5.0f) };
+    const ModSlider::Ptr m_pot_motion_threshold{ ModSlider::create(generate_name("PotMotionThreshold"), 10.0f, 180.0f, 60.0f) };
+    const ModSlider::Ptr m_pot_motion_max_speed{ ModSlider::create(generate_name("PotMotionMaxSpeed"), 60.0f, 540.0f, 240.0f) };
+    const ModSlider::Ptr m_pot_motion_smoothing{ ModSlider::create(generate_name("PotMotionSmoothing"), 0.5f, 30.0f, 8.0f) };
+    const ModSlider::Ptr m_pot_motion_avg_window{ ModSlider::create(generate_name("PotMotionAvgWindow"), 1.0f, 12.0f, 4.0f) };
     const ModToggle::Ptr m_extreme_compat_mode{ ModToggle::create(generate_name("ExtremeCompatibilityMode"), false, true) };
     const ModToggle::Ptr m_uncap_framerate{ ModToggle::create(generate_name("UncapFramerate"), true) };
     const ModToggle::Ptr m_disable_blur_widgets{ ModToggle::create(generate_name("DisableBlurWidgets"), true) };
@@ -1793,6 +1805,15 @@ public:
         m_options = {
             *m_rendering_method,
             *m_synced_afr_method,
+            *m_pot_damage_vignette_enabled,
+            *m_pot_damage_vignette_scale,
+            *m_pot_motion_vignette_enabled,
+            *m_pot_motion_base,
+            *m_pot_motion_peak,
+            *m_pot_motion_threshold,
+            *m_pot_motion_max_speed,
+            *m_pot_motion_smoothing,
+            *m_pot_motion_avg_window,
             *m_extreme_compat_mode,
             *m_uncap_framerate,
             *m_disable_hdr_compositing,
@@ -2058,9 +2079,60 @@ private:
         sdk::UObjectBase* object{nullptr};
         uint32_t index{};
         int32_t serial{};
+        uint8_t slot{}; // OverlayComponent POT_VIGNETTE_SLOT_RED/GREEN/BLUE
     };
     std::vector<PotHiddenWidget> m_pot_hidden_damage_widgets{};
+    std::vector<PotHiddenWidget> m_pot_damage_owner_widgets{};
     uint32_t m_pot_damage_overlay_scan_cursor{0};
+    std::unordered_set<void*> m_pot_damage_discovery_logged{};
+
+    // Live property watcher: catches the variable that actually drives the
+    // damage flash (sub-second states cannot be caught by button timing).
+    struct PotWatchedProperty {
+        uint32_t offset{};
+        uint8_t type{}; // 0 float, 1 double, 2 bool byte, 3 int32
+        std::string name;
+        double last{};
+        bool has_last{false};
+    };
+    struct PotWatchedWidget {
+        sdk::UObjectBase* object{nullptr};
+        uint32_t index{};
+        int32_t serial{};
+        std::string label;
+        std::vector<PotWatchedProperty> props;
+    };
+    std::vector<PotWatchedWidget> m_pot_damage_watch{};
+    size_t m_pot_damage_watch_build_count{0};
+
+    // Brush material parameter watch: the damage flash rides on MID scalar /
+    // vector parameters, not on any reflected widget property.
+    struct PotMaterialWatch {
+        sdk::UObjectBase* mid{nullptr};
+        uint32_t index{};
+        int32_t serial{};
+        uint8_t slot{};
+        uint32_t array_offset{};
+        uint32_t stride{};
+        uint32_t value_offset{};
+        bool is_vector{};
+        std::string label;
+        std::unordered_map<std::string, double> last_values{};
+    };
+    std::vector<PotMaterialWatch> m_pot_damage_material_watch{};
+    std::array<float, 3> m_pot_damage_mat_signal{{0.0f, 0.0f, 0.0f}};
+    std::array<float, 3> m_pot_damage_last_alpha{{-1.0f, -1.0f, -1.0f}};
+    std::array<float, 3> m_pot_damage_last_opacity{{-1.0f, -1.0f, -1.0f}};
+    std::chrono::steady_clock::time_point m_pot_damage_debug_log_time{};
+
+    std::chrono::steady_clock::time_point m_pot_motion_last_time{};
+    double m_pot_motion_last_yaw{0.0};
+    double m_pot_motion_last_pitch{0.0};
+    float m_pot_motion_alpha{0.0f};
+    float m_pot_motion_written_alpha{-1.0f};
+    std::array<float, 16> m_pot_motion_avg_buf{};
+    size_t m_pot_motion_avg_ptr{0};
+    size_t m_pot_motion_avg_count{0};
 
     // Path of Titans: the first headset wear can latch per-eye cameras with
     // divergent orientations; a runtime reinitialize shortly after wear fixes it.
