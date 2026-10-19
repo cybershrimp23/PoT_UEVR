@@ -220,6 +220,10 @@ public:
     // widgets_NNN.txt in the persistent dir for the character-view camera bug.
     void dump_pot_active_widgets();
 
+    // Render-path feature hooks (PoT dialog-pass census) read this to decide
+    // whether the expensive telemetry work should run this call.
+    bool pot_telemetry_active() { return m_pot_camera_telemetry->value(); }
+
     void reinitialize_renderer() {
         if (m_is_d3d12) {
             m_d3d12.force_reset();
@@ -1465,7 +1469,7 @@ private:
     const ModSlider::Ptr m_pot_motion_smoothing{ ModSlider::create(generate_name("PotMotionSmoothing"), 0.5f, 30.0f, 8.0f) };
     const ModSlider::Ptr m_pot_motion_release{ ModSlider::create(generate_name("PotMotionRelease"), 0.1f, 10.0f, 1.0f) };
     const ModSlider::Ptr m_pot_motion_avg_window{ ModSlider::create(generate_name("PotMotionAvgWindow"), 1.0f, 12.0f, 4.0f) };
-    const ModToggle::Ptr m_pot_dialog_force_2d{ ModToggle::create(generate_name("PotDialogForce2D")) };
+    const ModToggle::Ptr m_pot_camera_telemetry{ ModToggle::create(generate_name("PotCameraTelemetry")) };
     const ModToggle::Ptr m_extreme_compat_mode{ ModToggle::create(generate_name("ExtremeCompatibilityMode"), false, true) };
     const ModToggle::Ptr m_uncap_framerate{ ModToggle::create(generate_name("UncapFramerate"), true) };
     const ModToggle::Ptr m_disable_blur_widgets{ ModToggle::create(generate_name("DisableBlurWidgets"), true) };
@@ -1825,7 +1829,7 @@ public:
             *m_pot_motion_smoothing,
             *m_pot_motion_release,
             *m_pot_motion_avg_window,
-            *m_pot_dialog_force_2d,
+            *m_pot_camera_telemetry,
             *m_extreme_compat_mode,
             *m_uncap_framerate,
             *m_disable_hdr_compositing,
@@ -2090,25 +2094,17 @@ private:
     // Path of Titans ViewTarget watcher state (species-agnostic).
     std::mutex m_pot_view_target_mutex{};
     std::wstring m_pot_view_target_current{};
-    std::wstring m_pot_view_target_previous{};
     std::atomic<uint32_t> m_pot_view_target_changes_total{0};
     uint32_t m_pot_view_target_changes_since_log{};
     std::chrono::steady_clock::time_point m_pot_view_target_last_log{};
+    std::chrono::steady_clock::time_point m_pot_view_target_change_last_log{};
+    std::chrono::steady_clock::time_point m_pot_cache_split_last_log{};
+    sdk::UObject* m_pot_view_target_last_object{nullptr};
+    bool m_pot_view_target_watch_running{false};
     double m_pot_cam_loc_prev[3]{};
     bool m_pot_cam_loc_valid{false};
     uint64_t m_pot_cam_jumps_total{};
     std::chrono::steady_clock::time_point m_pot_cam_jump_last_log{};
-
-    // Path of Titans dialog detection: PlayerController cursor/input-lock
-    // booleans track UMG dialogs (character view etc.).
-    bool m_pot_cursor_known{false};
-    bool m_pot_cursor_last{false};
-    bool m_pot_input_lock_known{false};
-    bool m_pot_input_lock_last{false};
-    std::chrono::steady_clock::time_point m_pot_cursor_change_last_log{};
-    bool m_pot_auto2d_engaged{false};
-    bool m_pot_auto2d_previous{false};
-    std::chrono::steady_clock::time_point m_pot_auto2d_off_since{};
 
     // Path of Titans damage overlay hiding: rolling GObjects sweep state.
     struct PotHiddenWidget {

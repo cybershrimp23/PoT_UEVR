@@ -26686,7 +26686,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
 
     SPDLOG_INFO_ONCE("Called BeginRenderViewFamily for the first time");
 
-    if (path_of_titans_is_current_game()) {
+    if (path_of_titans_is_current_game() && VR::get()->pot_telemetry_active()) {
         // Pass census: how many scene render passes hit the engine per second,
         // how many are 2-view (stereo) passes, and on which render targets. A
         // dialog that quietly adds a second full stereo pass (its 3D preview)

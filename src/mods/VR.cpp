@@ -9130,37 +9130,126 @@ void VR::update_pot_view_target_watch(sdk::UGameEngine* engine) {
         return;
     }
 
+    if (!m_pot_camera_telemetry->value()) {
+        m_pot_view_target_watch_running = false;
+        return;
+    }
+
+    // Per-tick path is pointer identity plus numeric reads only: string
+    // formatting, name reflection, and GObjects enumeration all happen on the
+    // 2-second heartbeat or on throttled events.
     const auto pcm = get_primary_player_camera_manager(engine);
-    std::wstring name = L"(none)";
+    const auto now = std::chrono::steady_clock::now();
+
     sdk::UObject* target_object = nullptr;
 
     if (const auto target = read_pcm_view_target(pcm); target.has_value() && *target != nullptr) {
         target_object = *target;
-        const auto klass = target_object->get_class();
-        name = klass != nullptr ? klass->get_name_safe() : L"<unknown class>";
-        name += L" | ";
-        name += target_object->get_full_name();
     }
 
-    bool changed = false;
+    const bool target_changed = target_object != m_pot_view_target_last_object;
 
-    {
-        std::scoped_lock lock{m_pot_view_target_mutex};
-        changed = name != m_pot_view_target_previous;
-        if (changed) {
-            m_pot_view_target_previous = name;
-        }
-        m_pot_view_target_current = name;
-    }
-
-    if (changed) {
+    if (target_changed) {
+        m_pot_view_target_last_object = target_object;
         ++m_pot_view_target_changes_total;
         ++m_pot_view_target_changes_since_log;
     }
 
-    // Locations are the real story: the ViewTarget may stay on the pawn while
-    // the game teleports the pawn (or the whole camera) to the select area,
-    // and vice versa. Log both anchors plus the distance between them.
+    // Live render-POV jump detector. UE5 marshals FVector as three doubles.
+    bool cam_jump = false;
+    double cam_jump_dist = 0.0;
+    double cam_jump_from[3]{};
+    double cam_loc[3]{};
+    bool cam_ok = false;
+
+    if (pcm != nullptr) {
+        try {
+            uint8_t params[48]{};
+            pcm->call_function(L"GetCameraLocation", params);
+            const auto v = (const double*)params;
+
+            if (std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2])) {
+                cam_loc[0] = v[0];
+                cam_loc[1] = v[1];
+                cam_loc[2] = v[2];
+                cam_ok = true;
+
+                if (m_pot_cam_loc_valid) {
+                    const auto dx = cam_loc[0] - m_pot_cam_loc_prev[0];
+                    const auto dy = cam_loc[1] - m_pot_cam_loc_prev[1];
+                    const auto dz = cam_loc[2] - m_pot_cam_loc_prev[2];
+                    cam_jump_dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+                    // 10 m in one tick: a sprinting dino moves < 1 m/tick;
+                    // anything above this is a teleport or two-camera fight.
+                    if (cam_jump_dist > 1000.0) {
+                        cam_jump = true;
+                        ++m_pot_cam_jumps_total;
+                        cam_jump_from[0] = m_pot_cam_loc_prev[0];
+                        cam_jump_from[1] = m_pot_cam_loc_prev[1];
+                        cam_jump_from[2] = m_pot_cam_loc_prev[2];
+                    }
+                }
+
+                m_pot_cam_loc_prev[0] = cam_loc[0];
+                m_pot_cam_loc_prev[1] = cam_loc[1];
+                m_pot_cam_loc_prev[2] = cam_loc[2];
+                m_pot_cam_loc_valid = true;
+            }
+        } catch (...) {
+        }
+    }
+
+    // Divergence between the engine's own camera caches: two cameras live at
+    // once. Numeric-only per tick; the string is built only when logging.
+    double cache_max_spread = 0.0;
+
+    if (pcm != nullptr && resolve_game_fov_offsets()) {
+        const int32_t probe_offsets[4] = {
+            g_game_fov_resolver.camera_cache_private_offset,
+            g_game_fov_resolver.camera_cache_offset,
+            g_game_fov_resolver.last_frame_camera_cache_private_offset,
+            g_game_fov_resolver.last_frame_camera_cache_offset,
+        };
+
+        double last_valid[3]{};
+        bool have_last = false;
+
+        for (const auto probe_offset : probe_offsets) {
+            if (probe_offset <= 0) {
+                continue;
+            }
+
+            const auto base = (const double*)((const uint8_t*)pcm + probe_offset +
+                g_game_fov_resolver.pov_offset + g_game_fov_resolver.location_offset);
+
+            if (!std::isfinite(base[0]) || !std::isfinite(base[1]) || !std::isfinite(base[2])) {
+                continue;
+            }
+
+            if (have_last) {
+                const auto dx = base[0] - last_valid[0];
+                const auto dy = base[1] - last_valid[1];
+                const auto dz = base[2] - last_valid[2];
+                const auto spread = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+                if (spread > cache_max_spread) {
+                    cache_max_spread = spread;
+                }
+            }
+
+            last_valid[0] = base[0];
+            last_valid[1] = base[1];
+            last_valid[2] = base[2];
+            have_last = true;
+        }
+    }
+
+    // String builders; used only at log time.
+    const auto fmt_loc = [](const double* value) {
+        return std::format("({:.0f}, {:.0f}, {:.0f})", value[0], value[1], value[2]);
+    };
+
     const auto actor_location = [](sdk::UObject* object) -> std::string {
         try {
             if (object == nullptr || !object->is_a(sdk::AActor::static_class())) {
@@ -9180,307 +9269,117 @@ void VR::update_pot_view_target_watch(sdk::UGameEngine* engine) {
         }
     };
 
-    std::string pawn_location = "n/a";
-    sdk::UObject* pawn_object = nullptr;
-    sdk::APlayerController* player_controller = nullptr;
-
-    try {
-        const auto world = engine != nullptr ? engine->get_world() : nullptr;
-        const auto gameplay = sdk::UGameplayStatics::get();
-
-        if (world != nullptr && gameplay != nullptr) {
-            player_controller = gameplay->get_player_controller(world, 0);
-
-            if (player_controller != nullptr) {
-                uint8_t params[8]{};
-                player_controller->call_function(L"GetPawn", params);
-
-                const auto candidate = (sdk::UObject*)params[0];
-
-                if (candidate != nullptr && !IsBadReadPtr(candidate, sizeof(void*) * 4)) {
-                    pawn_object = candidate;
-                    pawn_location = actor_location(pawn_object);
-                }
-            }
-        }
-    } catch (...) {
-        pawn_location = "err";
-    }
-
-    // UMG dialogs (character view, inventory, chat...) take the mouse cursor
-    // and lock input. These two PlayerController bools are the cheapest
-    // generic "a dialog is open" signal; also used for the [PoT][UISignal]
-    // telemetry lines to validate against the reported camera break.
-    bool cursor_visible = false;
-    bool cursor_known = false;
-    bool input_locked = false;
-    bool input_lock_known = false;
-
-    if (player_controller != nullptr) {
-        try {
-            const auto pc_class = player_controller->get_class();
-
-            if (const auto prop = get_bool_property_descriptor(pc_class, L"bShowCursor"); prop != nullptr) {
-                cursor_visible = prop->get_value_from_object((void*)player_controller);
-                cursor_known = true;
-            }
-
-            if (const auto prop = get_bool_property_descriptor(pc_class, L"bInputLocked"); prop != nullptr) {
-                input_locked = prop->get_value_from_object((void*)player_controller);
-                input_lock_known = true;
-            }
-        } catch (...) {
-        }
-    }
-
-    m_pot_cursor_known = cursor_known;
-    m_pot_input_lock_known = input_lock_known;
-
-    const auto now = std::chrono::steady_clock::now();
-
-    if (cursor_known && cursor_visible != m_pot_cursor_last) {
-        if (m_pot_cursor_change_last_log.time_since_epoch().count() == 0 ||
-            now - m_pot_cursor_change_last_log >= std::chrono::milliseconds(500)) {
-            m_pot_cursor_change_last_log = now;
-            spdlog::info("[PoT][UISignal] bShowCursor {} -> {} (bInputLocked {})",
-                m_pot_cursor_last, cursor_visible, input_locked);
+    const auto target_name = [](sdk::UObject* object) -> std::wstring {
+        if (object == nullptr) {
+            return L"(none)";
         }
 
-        m_pot_cursor_last = cursor_visible;
-    }
+        const auto klass = object->get_class();
+        std::wstring name = klass != nullptr ? klass->get_name_safe() : L"<unknown class>";
+        name += L" | ";
+        name += object->get_full_name();
+        return name;
+    };
 
-    if (input_lock_known && input_locked != m_pot_input_lock_last) {
-        if (m_pot_cursor_change_last_log.time_since_epoch().count() == 0 ||
-            now - m_pot_cursor_change_last_log >= std::chrono::milliseconds(500)) {
-            m_pot_cursor_change_last_log = now;
-            spdlog::info("[PoT][UISignal] bInputLocked {} -> {} (bShowCursor {})",
-                m_pot_input_lock_last, input_locked, cursor_visible);
+    const auto cache_fingerprint = [pcm]() -> std::string {
+        if (pcm == nullptr || !g_game_fov_resolver.valid) {
+            return "n/a";
         }
 
-        m_pot_input_lock_last = input_locked;
-    }
+        struct Probe { const char* label; int32_t offset; };
 
-    // Optional: while a dialog is open, hand the headset a flat 2D image of
-    // the game window instead of the (broken) stereo world. Restores the
-    // user's own 2D setting when the dialog closes, with a short debounce so
-    // quick close/reopen sequences do not thrash the mode.
-    if (m_pot_dialog_force_2d->value() && cursor_known) {
-        if (cursor_visible) {
-            m_pot_auto2d_off_since = {};
-
-            if (!m_pot_auto2d_engaged) {
-                m_pot_auto2d_engaged = true;
-                m_pot_auto2d_previous = m_2d_screen_mode->value();
-
-                if (!m_2d_screen_mode->value()) {
-                    m_2d_screen_mode->value() = true;
-                }
-
-                spdlog::info("[PoT][Auto2D] engaged (dialog open); previous 2D={}", m_pot_auto2d_previous);
-            }
-        }
-        else if (m_pot_auto2d_engaged) {
-            if (m_pot_auto2d_off_since.time_since_epoch().count() == 0) {
-                m_pot_auto2d_off_since = now;
-            }
-            else if (now - m_pot_auto2d_off_since >= std::chrono::milliseconds(400)) {
-                m_pot_auto2d_engaged = false;
-                m_pot_auto2d_off_since = {};
-
-                if (m_2d_screen_mode->value() != m_pot_auto2d_previous) {
-                    m_2d_screen_mode->value() = m_pot_auto2d_previous;
-                }
-
-                spdlog::info("[PoT][Auto2D] released (dialog closed); restored 2D={}", m_pot_auto2d_previous);
-            }
-        }
-    }
-    else if (m_pot_auto2d_engaged) {
-        m_pot_auto2d_engaged = false;
-        m_pot_auto2d_off_since = {};
-
-        if (m_2d_screen_mode->value() != m_pot_auto2d_previous) {
-            m_2d_screen_mode->value() = m_pot_auto2d_previous;
-        }
-
-        spdlog::info("[PoT][Auto2D] released (setting off); restored 2D={}", m_pot_auto2d_previous);
-    }
-
-    double separation = -1.0;
-
-    try {
-        if (pawn_object != nullptr && target_object != nullptr
-            && target_object->is_a(sdk::AActor::static_class())
-            && pawn_object->is_a(sdk::AActor::static_class())) {
-            const auto a = ((sdk::AActor*)target_object)->get_actor_location();
-            const auto b = ((sdk::AActor*)pawn_object)->get_actor_location();
-            const auto dx = a.x - b.x;
-            const auto dy = a.y - b.y;
-            const auto dz = a.z - b.z;
-            separation = std::sqrt(dx * dx + dy * dy + dz * dz);
-        }
-    } catch (...) {
-        separation = -1.0;
-    }
-
-    // The ViewTarget can stay perfectly stable while the actual render POV
-    // jumps around every frame (character-view bug), so measure the live
-    // camera location itself. UE5 marshals FVector as three doubles.
-    std::string cam_loc_str = "n/a";
-    bool cam_jump = false;
-    double cam_loc[3]{};
-
-    if (pcm != nullptr) {
-        try {
-            uint8_t params[48]{};
-            pcm->call_function(L"GetCameraLocation", params);
-            const auto v = (const double*)params;
-
-            if (std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2])) {
-                cam_loc[0] = v[0];
-                cam_loc[1] = v[1];
-                cam_loc[2] = v[2];
-                cam_loc_str = std::format("({:.0f}, {:.0f}, {:.0f})", cam_loc[0], cam_loc[1], cam_loc[2]);
-
-                if (m_pot_cam_loc_valid) {
-                    const auto dx = cam_loc[0] - m_pot_cam_loc_prev[0];
-                    const auto dy = cam_loc[1] - m_pot_cam_loc_prev[1];
-                    const auto dz = cam_loc[2] - m_pot_cam_loc_prev[2];
-                    const auto dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-
-                    // 10 m in one tick: sprinting dino moves < 1 m/tick;
-                    // anything above this is a teleport or two-camera fight.
-                    if (dist > 1000.0) {
-                        cam_jump = true;
-                        ++m_pot_cam_jumps_total;
-
-                        if (m_pot_cam_jump_last_log.time_since_epoch().count() == 0 ||
-                            now - m_pot_cam_jump_last_log >= std::chrono::seconds(1)) {
-                            m_pot_cam_jump_last_log = now;
-                            spdlog::info(
-                                "[PoT][ViewTarget] CAMERA POSITION JUMP #{} over {:.0f} cm: {} -> {}",
-                                m_pot_cam_jumps_total,
-                                dist,
-                                std::format("({:.0f}, {:.0f}, {:.0f})", m_pot_cam_loc_prev[0], m_pot_cam_loc_prev[1], m_pot_cam_loc_prev[2]),
-                                cam_loc_str);
-                        }
-                    }
-                }
-
-                m_pot_cam_loc_prev[0] = cam_loc[0];
-                m_pot_cam_loc_prev[1] = cam_loc[1];
-                m_pot_cam_loc_prev[2] = cam_loc[2];
-                m_pot_cam_loc_valid = true;
-            }
-        } catch (...) {
-            cam_loc_str = "err";
-        }
-    }
-
-    // Fingerprint every camera cache the engine holds. When a UI/dialog drives a
-    // second view, these caches diverge: the render view vs the last-frame view
-    // is exactly the "two camera views" the user sees flipping. Sample them all
-    // and report the pairwise spread. UE5 stores FVector as three doubles.
-    std::string cache_str;
-    double cache_max_spread = 0.0;
-    bool cache_split = false;
-
-    if (resolve_game_fov_offsets()) {
-        struct CacheProbe {
-            const char* label;
-            int32_t offset;
-        };
-
-        const CacheProbe probes[] = {
+        const Probe probes[] = {
             {"priv", g_game_fov_resolver.camera_cache_private_offset},
             {"pub", g_game_fov_resolver.camera_cache_offset},
             {"lastPriv", g_game_fov_resolver.last_frame_camera_cache_private_offset},
             {"lastPub", g_game_fov_resolver.last_frame_camera_cache_offset},
         };
 
-        double last_valid[3]{0.0, 0.0, 0.0};
-        bool have_last_valid = false;
+        std::string out{};
 
         for (const auto& probe : probes) {
             if (probe.offset <= 0) {
-                cache_str += std::format(" {}=n/a", probe.label);
+                out += std::format(" {}=n/a", probe.label);
                 continue;
             }
 
-            const auto vec_base = (const double*)((const uint8_t*)pcm + probe.offset +
+            const auto vec = (const double*)((const uint8_t*)pcm + probe.offset +
                 g_game_fov_resolver.pov_offset + g_game_fov_resolver.location_offset);
 
-            const double cx = vec_base[0];
-            const double cy = vec_base[1];
-            const double cz = vec_base[2];
-
-            if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(cz)) {
-                cache_str += std::format(" {}=nan", probe.label);
+            if (!std::isfinite(vec[0]) || !std::isfinite(vec[1]) || !std::isfinite(vec[2])) {
+                out += std::format(" {}=nan", probe.label);
                 continue;
             }
 
-            float fov = 0.0f;
-            const auto fov_base = (const float*)((const uint8_t*)pcm + probe.offset +
+            const auto fov = *(const float*)((const uint8_t*)pcm + probe.offset +
                 g_game_fov_resolver.pov_offset + g_game_fov_resolver.fov_offset);
-            fov = *fov_base;
 
-            cache_str += std::format(" {}=({:.0f},{:.0f},{:.0f} f{:.0f})", probe.label, cx, cy, cz, fov);
-
-            if (have_last_valid) {
-                const auto dx = cx - last_valid[0];
-                const auto dy = cy - last_valid[1];
-                const auto dz = cz - last_valid[2];
-                const auto spread = std::sqrt(dx * dx + dy * dy + dz * dz);
-
-                if (spread > cache_max_spread) {
-                    cache_max_spread = spread;
-                }
-            }
-
-            last_valid[0] = cx;
-            last_valid[1] = cy;
-            last_valid[2] = cz;
-            have_last_valid = true;
+            out += std::format(" {}=({:.0f},{:.0f},{:.0f} f{:.0f})", probe.label, vec[0], vec[1], vec[2], fov);
         }
 
-        // More than 5 m divergence between the engine's own camera caches means
-        // two different cameras are live at once - the signature of this bug.
-        cache_split = cache_max_spread > 500.0;
+        return out;
+    };
 
-        if (cache_split && (m_pot_view_target_last_log.time_since_epoch().count() == 0 ||
-            now - m_pot_cam_jump_last_log >= std::chrono::seconds(1))) {
-            m_pot_cam_jump_last_log = now;
-            spdlog::info("[PoT][ViewTarget] CAMERA CACHE SPLIT spread={:.0f}cm{}", cache_max_spread, cache_str);
-        }
+    // Throttled event logs.
+    if (cam_jump && (m_pot_cam_jump_last_log.time_since_epoch().count() == 0 ||
+        now - m_pot_cam_jump_last_log >= std::chrono::seconds(1))) {
+        m_pot_cam_jump_last_log = now;
+        spdlog::info("[PoT][ViewTarget] CAMERA POSITION JUMP #{} over {:.0f} cm: {} -> {}",
+            m_pot_cam_jumps_total, cam_jump_dist, fmt_loc(cam_jump_from), fmt_loc(cam_loc));
     }
 
-    // First log line at least every 2s even when nothing changes (heartbeat):
-    // the camera break may move the anchors while the ViewTarget stays put.
-    const bool heartbeat = m_pot_view_target_last_log.time_since_epoch().count() == 0
+    // More than 5 m divergence between the engine's own camera caches means
+    // two different cameras are live at once.
+    if (cache_max_spread > 500.0 && (m_pot_cache_split_last_log.time_since_epoch().count() == 0 ||
+        now - m_pot_cache_split_last_log >= std::chrono::seconds(1))) {
+        m_pot_cache_split_last_log = now;
+        spdlog::info("[PoT][ViewTarget] CAMERA CACHE SPLIT spread={:.0f}cm{}", cache_max_spread, cache_fingerprint());
+    }
+
+    if (target_changed && (m_pot_view_target_change_last_log.time_since_epoch().count() == 0 ||
+        now - m_pot_view_target_change_last_log >= std::chrono::milliseconds(500))) {
+        m_pot_view_target_change_last_log = now;
+        const auto name = target_name(target_object);
+
+        {
+            std::scoped_lock lock{m_pot_view_target_mutex};
+            m_pot_view_target_current = name;
+        }
+
+        spdlog::info("[PoT][ViewTarget] now '{}' ({} change(s) since last log, {} total)",
+            utility::narrow(name), m_pot_view_target_changes_since_log, m_pot_view_target_changes_total.load());
+    }
+
+    // Full fingerprint (with the expensive enumerations) at least every 2 s.
+    const bool heartbeat = !m_pot_view_target_watch_running
+        || m_pot_view_target_last_log.time_since_epoch().count() == 0
         || now - m_pot_view_target_last_log >= std::chrono::seconds(2);
 
-    if (changed || heartbeat) {
+    m_pot_view_target_watch_running = true;
+
+    if (heartbeat) {
         m_pot_view_target_last_log = now;
-        spdlog::info("[PoT][ViewTarget] {} '{}' targetLoc={} camLoc={} pawnLoc={} sep={:.0f} camJumps={} cursor={} lock={} cache={} cacheSplit={} ({} change(s) since last log, {} total)",
-            changed ? "now" : "hold",
-            utility::narrow(name),
+
+        const auto hb_name = target_name(target_object);
+
+        {
+            std::scoped_lock lock{m_pot_view_target_mutex};
+            m_pot_view_target_current = hb_name;
+        }
+
+        spdlog::info("[PoT][ViewTarget] hold '{}' targetLoc={} camLoc={} camJumps={} cache={} ({} change(s) since last log, {} total)",
+            utility::narrow(hb_name),
             actor_location(target_object),
-            cam_loc_str,
-            pawn_location,
-            separation,
+            cam_ok ? fmt_loc(cam_loc) : std::string{"n/a"},
             m_pot_cam_jumps_total,
-            cursor_known ? (cursor_visible ? "visible" : "hidden") : "unknown",
-            input_lock_known ? (input_locked ? "locked" : "free") : "unknown",
-            cache_str,
-            cache_split,
+            cache_fingerprint(),
             m_pot_view_target_changes_since_log,
             m_pot_view_target_changes_total.load());
+
         m_pot_view_target_changes_since_log = 0;
 
-        // The primary PCM can look perfectly calm while a second camera source
-        // (extra PlayerCameraManager from a dialog-local player, or a transient
-        // SceneCaptureComponent2D) fights for the same backbuffer. Enumerate
-        // every candidate source on the heartbeat to catch that.
+        // Second camera sources that stay invisible otherwise: live
+        // PlayerCameraManagers and transient scene captures.
         std::string aux{};
 
         try {
@@ -11580,7 +11479,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             ImGui::TextWrapped("Writes widgets_NNN.txt: capture once normally, again with the dialog open, then diff.");
         }
 
-        m_pot_dialog_force_2d->draw("Force 2D While Dialog Open (cursor visible)");
+        m_pot_camera_telemetry->draw("Camera Telemetry (debug log + live ViewTarget)");
 
         m_pot_motion_vignette_enabled->draw("Vignette On Camera Rotation");
         if (m_pot_motion_vignette_enabled->value()) {
