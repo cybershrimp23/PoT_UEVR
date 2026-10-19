@@ -9780,6 +9780,12 @@ void VR::rebuild_pot_damage_watch(sdk::FUObjectArray* object_array) {
     };
 
     for (const auto& entry : m_pot_hidden_damage_widgets) {
+        const auto item = object_array->get_object(static_cast<int32_t>(entry.index));
+
+        if (item == nullptr || item->get_object() != entry.object || item->get_serial_number() != entry.serial) {
+            continue;
+        }
+
         attach(entry.object, entry.slot, "image");
     }
 
@@ -10164,9 +10170,18 @@ void VR::update_pot_damage_overlay() {
         return;
     }
 
-    // Rolling sweep: bounded slice per engine tick so a huge object buffer
-    // cannot hitch the game thread. Widgets the game un-hides (damage events)
-    // are re-hidden within one sweep.
+    const auto tick_now = std::chrono::steady_clock::now();
+
+    // Discovery scan: the full GObjects walk (a string allocation per object)
+    // runs only every 3 seconds, sliced across ticks so it cannot hitch the
+    // game thread. Between scans, the hot pass below keeps every known widget
+    // hidden, reacting within a single tick to damage-driven un-hides.
+    if (!m_pot_damage_scan_active &&
+        (m_pot_damage_next_scan.time_since_epoch().count() == 0 || tick_now >= m_pot_damage_next_scan)) {
+        m_pot_damage_scan_active = true;
+        m_pot_damage_overlay_scan_cursor = 0;
+    }
+
     constexpr uint32_t slice = 16384;
 
     if (m_pot_damage_overlay_scan_cursor >= static_cast<uint32_t>(object_count)) {
@@ -10175,6 +10190,7 @@ void VR::update_pot_damage_overlay() {
 
     const auto end = std::min(m_pot_damage_overlay_scan_cursor + slice, static_cast<uint32_t>(object_count));
 
+    if (m_pot_damage_scan_active) {
     for (auto i = m_pot_damage_overlay_scan_cursor; i < end; ++i) {
         try {
             const auto item = object_array->get_object(static_cast<int32_t>(i));
@@ -10285,11 +10301,27 @@ void VR::update_pot_damage_overlay() {
                     slot = static_cast<uint8_t>(vrmod::OverlayComponent::POT_VIGNETTE_SLOT_BLUE);
                 }
 
+                // Cache the property offsets now (reflection search per
+                // discovery, raw offsets for the per-tick hot pass and mirror).
+                int32_t visibility_offset = -1;
+
+                if (const auto vp = ((sdk::UObject*)object)->get_property_data(L"Visibility"); vp != nullptr) {
+                    visibility_offset = (int32_t)((uintptr_t)vp - (uintptr_t)object);
+                }
+
+                int32_t render_opacity_offset = -1;
+
+                if (const auto op = ((sdk::UObject*)object)->get_property_data(L"RenderOpacity"); op != nullptr) {
+                    render_opacity_offset = (int32_t)((uintptr_t)op - (uintptr_t)object);
+                }
+
                 m_pot_hidden_damage_widgets.push_back(PotHiddenWidget{
                     object,
                     i,
                     item->get_serial_number(),
                     slot,
+                    visibility_offset,
+                    render_opacity_offset,
                 });
 
                 spdlog::info("[PoT][DamageOverlay] Hiding damage overlay widget '{}' -> vignette slot {}",
@@ -10327,11 +10359,19 @@ void VR::update_pot_damage_overlay() {
                         const auto owner_item = object_array->get_object(static_cast<int32_t>(owner_index));
 
                         if (owner_item != nullptr && owner_item->get_object() == owner) {
+                            int32_t owner_opacity_offset = -1;
+
+                            if (const auto op = ((sdk::UObject*)owner)->get_property_data(L"RenderOpacity"); op != nullptr) {
+                                owner_opacity_offset = (int32_t)((uintptr_t)op - (uintptr_t)owner);
+                            }
+
                             m_pot_damage_owner_widgets.push_back(PotHiddenWidget{
                                 owner,
                                 owner_index,
                                 owner_item->get_serial_number(),
                                 slot,
+                                -1,
+                                owner_opacity_offset,
                             });
 
                             spdlog::info("[PoT][DamageOverlay] Mirroring owner widget '{}' -> vignette slot {}",
@@ -10347,11 +10387,47 @@ void VR::update_pot_damage_overlay() {
         }
     }
 
-    m_pot_damage_overlay_scan_cursor = end >= static_cast<uint32_t>(object_count) ? 0 : end;
+        m_pot_damage_overlay_scan_cursor = end >= static_cast<uint32_t>(object_count) ? 0 : end;
+
+        if (m_pot_damage_overlay_scan_cursor == 0) {
+            m_pot_damage_scan_active = false;
+            m_pot_damage_next_scan = tick_now + std::chrono::seconds(3);
+        }
+    }
+
+    // Hot pass (every tick, allocation-free): re-hide any cached widget the
+    // game just un-hid, using the offsets captured at discovery.
+    constexpr uint8_t hidden_mode_hot = 2; // EVisibility::Hidden
+
+    for (const auto& entry : m_pot_hidden_damage_widgets) {
+        try {
+            if (entry.visibility_offset < 0) {
+                continue;
+            }
+
+            const auto item = object_array->get_object(static_cast<int32_t>(entry.index));
+
+            if (item == nullptr || item->get_object() != entry.object || item->get_serial_number() != entry.serial) {
+                continue;
+            }
+
+            const auto vis = (const uint8_t*)((const uint8_t*)entry.object + entry.visibility_offset);
+
+            if (IsBadReadPtr(vis, sizeof(uint8_t)) || *vis == hidden_mode_hot) {
+                continue;
+            }
+
+            ((sdk::UObject*)entry.object)->call_function(L"SetVisibility", (void*)&hidden_mode_hot);
+        } catch (...) {
+        }
+    }
 
     // Feed every live damage widget's RenderOpacity (image + owning BP_UMG_
     // effect widget) straight into its head-locked vignette slot. The game
     // animates the opacity itself, so no smoothing/decay layer is applied.
+    // Whole block is SEH-guarded (project is /EHa): a bad reflected read must
+    // never take the game down; it degrades to "no mirror this tick".
+    try {
     if (m_pot_damage_vignette_enabled->value()) {
         std::array<float, 3> max_opacity{{0.0f, 0.0f, 0.0f}};
         std::array<size_t, 3> live_count{{0, 0, 0}};
@@ -10365,7 +10441,13 @@ void VR::update_pot_damage_overlay() {
                 return;
             }
 
-            const auto opacity_ptr = ((sdk::UObject*)entry.object)->get_property_data(L"RenderOpacity");
+            const void* opacity_ptr = nullptr;
+
+            if (entry.render_opacity_offset >= 0) {
+                opacity_ptr = (const uint8_t*)entry.object + entry.render_opacity_offset;
+            } else {
+                opacity_ptr = ((sdk::UObject*)entry.object)->get_property_data(L"RenderOpacity");
+            }
 
             if (opacity_ptr == nullptr || IsBadReadPtr(opacity_ptr, sizeof(float))) {
                 return;
@@ -10457,6 +10539,15 @@ void VR::update_pot_damage_overlay() {
                 m_overlay_component.set_pot_vignette_alpha(vrmod::OverlayComponent::POT_VIGNETTE_SLOT_RED + static_cast<int>(s), 0.0f);
             }
         }
+    }
+    } catch (...) {
+        // Drop the half-built watch state; the discovery scan will re-track
+        // and rebuild will re-run from scratch once the widgets are sound.
+        m_pot_damage_watch.clear();
+        m_pot_damage_material_watch.clear();
+        m_pot_damage_watch_build_count = 0;
+        m_pot_damage_mat_signal = {};
+        SPDLOG_ERROR_EVERY_N_SEC(5, "[PoT][DamageMirror] guarded an exception during mirror/watch update");
     }
 }
 

@@ -2106,16 +2106,21 @@ private:
     uint64_t m_pot_cam_jumps_total{};
     std::chrono::steady_clock::time_point m_pot_cam_jump_last_log{};
 
-    // Path of Titans damage overlay hiding: rolling GObjects sweep state.
+    // Path of Titans damage overlay hiding: periodic discovery scan plus a
+    // per-tick hot pass over cached references only.
     struct PotHiddenWidget {
         sdk::UObjectBase* object{nullptr};
         uint32_t index{};
         int32_t serial{};
         uint8_t slot{}; // OverlayComponent POT_VIGNETTE_SLOT_RED/GREEN/BLUE
+        int32_t visibility_offset{-1};
+        int32_t render_opacity_offset{-1};
     };
     std::vector<PotHiddenWidget> m_pot_hidden_damage_widgets{};
     std::vector<PotHiddenWidget> m_pot_damage_owner_widgets{};
     uint32_t m_pot_damage_overlay_scan_cursor{0};
+    bool m_pot_damage_scan_active{false};
+    std::chrono::steady_clock::time_point m_pot_damage_next_scan{};
     std::unordered_set<void*> m_pot_damage_discovery_logged{};
 
     // Live property watcher: catches the variable that actually drives the
