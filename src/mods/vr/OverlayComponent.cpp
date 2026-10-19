@@ -1615,13 +1615,12 @@ void OverlayComponent::update_pot_vignette_pool_openvr() {
     }
 
     const auto hide_slot = [&](int slot) {
-        if (m_pot_vignette_handles[slot] != 0) {
+        // OpenVR IPC only when the slot is actually showing; HideOverlay on an
+        // already-hidden overlay every frame is pure compositor churn.
+        if (m_pot_vignette_handles[slot] != 0 && m_pot_vignette_shown[slot]) {
             vr::VROverlay()->HideOverlay(m_pot_vignette_handles[slot]);
-
-            if (m_pot_vignette_shown[slot]) {
-                m_pot_vignette_shown[slot] = false;
-                spdlog::info("[PotVignette] slot {} hidden", slot);
-            }
+            m_pot_vignette_shown[slot] = false;
+            spdlog::info("[PotVignette] slot {} hidden", slot);
         }
     };
 
@@ -1636,6 +1635,35 @@ void OverlayComponent::update_pot_vignette_pool_openvr() {
     // failure backoff: retry failed slots at most every 1s while broken
     const auto now = std::chrono::steady_clock::now();
     if (m_pot_vignette_fail_backoff > now) {
+        return;
+    }
+
+    // Idle fast path: when no slot wants to be visible, hide any that still
+    // are and skip the pose fetch + per-slot work entirely.
+    bool any_slot_active = false;
+
+    for (auto slot = 0; slot < POT_VIGNETTE_SLOT_COUNT; ++slot) {
+        if (m_pot_vignette_handles[slot] == 0) {
+            continue;
+        }
+
+        const auto slot_enabled = (slot == POT_VIGNETTE_SLOT_MOTION)
+            ? m_pot_vignette_motion_enabled->value()
+            : m_pot_vignette_damage_enabled->value();
+
+        const auto alpha = m_pot_vignette_alphas[slot].load(std::memory_order_relaxed);
+
+        if (slot_enabled && alpha > 0.002f) {
+            any_slot_active = true;
+            break;
+        }
+    }
+
+    if (!any_slot_active) {
+        for (auto slot = 0; slot < POT_VIGNETTE_SLOT_COUNT; ++slot) {
+            hide_slot(slot);
+        }
+
         return;
     }
 
