@@ -1704,6 +1704,22 @@ bool avowed_is_current_game() {
     return result;
 }
 
+bool path_of_titans_is_current_game() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && uevr::games::is_path_of_titans_executable_path(*exe_path);
+    }();
+
+    return result;
+}
+
+// Path of Titans dialog-pass isolation state: the 2-view scene pass on the
+// established render target is the only pass UEVR may touch; single-view
+// passes into other targets (the character-view dialog's 3D preview) must not
+// publish pose/frame state. See begin_render_viewfamily.
+static std::atomic<uintptr_t> g_pot_primary_scene_target{0};
+static std::atomic<uint64_t> g_pot_aux_pass_skips{0};
+
 bool dune_awakening_is_current_game() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -26670,6 +26686,81 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
 
     SPDLOG_INFO_ONCE("Called BeginRenderViewFamily for the first time");
 
+    if (path_of_titans_is_current_game()) {
+        // Pass census: how many scene render passes hit the engine per second,
+        // how many are 2-view (stereo) passes, and on which render targets. A
+        // dialog that quietly adds a second full stereo pass (its 3D preview)
+        // is what flips the world between "two camera views" while every game
+        // camera cache stays identical.
+        static std::atomic<uint64_t> pot_pass_calls{0};
+        static std::atomic<uint64_t> pot_pass_stereo_calls{0};
+        static std::atomic<uint32_t> pot_pass_max_views{0};
+        static std::mutex pot_pass_targets_mtx{};
+        static std::vector<uintptr_t> pot_pass_targets{};
+        static auto pot_pass_last_log = std::chrono::steady_clock::now();
+
+        pot_pass_calls.fetch_add(1, std::memory_order_relaxed);
+
+        uint32_t views_in_call = 0;
+        uintptr_t target_id = 0;
+
+        try {
+            const auto target = view_family.get_render_target();
+            target_id = reinterpret_cast<uintptr_t>(target);
+
+            const auto views = view_family.get_views();
+
+            if (views != nullptr && !IsBadReadPtr(views, sizeof(*views)) &&
+                views->data != nullptr && views->count > 0 && views->count <= 16) {
+                views_in_call = static_cast<uint32_t>(views->count);
+            }
+        } catch (...) {
+        }
+
+        if (views_in_call == 2) {
+            pot_pass_stereo_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        uint32_t prev_max = pot_pass_max_views.load(std::memory_order_relaxed);
+
+        while (views_in_call > prev_max && !pot_pass_max_views.compare_exchange_weak(prev_max, views_in_call, std::memory_order_relaxed)) {
+        }
+
+        if (target_id != 0) {
+            std::scoped_lock lock{pot_pass_targets_mtx};
+
+            if (pot_pass_targets.size() < 8 &&
+                std::find(pot_pass_targets.begin(), pot_pass_targets.end(), target_id) == pot_pass_targets.end()) {
+                pot_pass_targets.push_back(target_id);
+            }
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+
+        if (now - pot_pass_last_log >= std::chrono::seconds(2)) {
+            std::scoped_lock lock{pot_pass_targets_mtx};
+            std::string targets{};
+
+            for (const auto target : pot_pass_targets) {
+                if (!targets.empty()) {
+                    targets += ",";
+                }
+
+                targets += std::format("{:x}", target);
+            }
+
+            spdlog::info("[PoT][ViewPass] calls={} stereo2={} maxViews={} auxSkips={} targets=[{}]",
+                pot_pass_calls.exchange(0),
+                pot_pass_stereo_calls.exchange(0),
+                pot_pass_max_views.exchange(0),
+                g_pot_aux_pass_skips.exchange(0),
+                targets);
+
+            pot_pass_targets.clear();
+            pot_pass_last_log = now;
+        }
+    }
+
     if (!g_framework->is_game_data_intialized()) {
         return;
     }
@@ -26688,6 +26779,42 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
         dimension_shift_is_auxiliary_view_family(&view_family, "BeginRenderViewFamily"))
     {
         return;
+    }
+
+    if (path_of_titans_is_current_game()) {
+        // The census (viewed in-game via [PoT][ViewPass]) proved the character
+        // view dialog runs extra single-view scene passes into its own render
+        // target every frame while the real 2-view scene pass stays constant.
+        // UEVR must ignore those passes entirely: pose publication, frame
+        // tokens, and AFR/native-stereo bookkeeping all key off this callback,
+        // and a second pass per frame makes the HMD ping-pong between the game
+        // camera and the dialog preview camera.
+        uintptr_t family_target = 0;
+        uint32_t family_views = 0;
+
+        try {
+            family_target = reinterpret_cast<uintptr_t>(view_family.get_render_target());
+
+            const auto views = view_family.get_views();
+
+            if (views != nullptr && !IsBadReadPtr(views, sizeof(*views)) &&
+                views->data != nullptr && views->count >= 0 && views->count <= 16) {
+                family_views = static_cast<uint32_t>(views->count);
+            }
+        } catch (...) {
+        }
+
+        if (family_views >= 2 && family_target != 0) {
+            g_pot_primary_scene_target.store(family_target, std::memory_order_release);
+        }
+        else if (family_views <= 1 && family_target != 0) {
+            const auto primary = g_pot_primary_scene_target.load(std::memory_order_acquire);
+
+            if (primary != 0 && family_target != primary) {
+                g_pot_aux_pass_skips.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
     }
 
     if (auto view_family_target = view_family.get_render_target(); view_family_target != nullptr) {

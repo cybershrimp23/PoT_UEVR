@@ -4865,6 +4865,7 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
 
     update_pot_damage_overlay();
     update_pot_motion_vignette(engine, delta);
+    update_pot_view_target_watch(engine);
 
     const auto now = std::chrono::steady_clock::now();
     const auto previous_engine_tick = m_last_engine_tick.load(std::memory_order_relaxed);
@@ -9124,6 +9125,554 @@ void VR::update_pot_motion_vignette(sdk::UGameEngine* engine, float delta) {
     }
 }
 
+void VR::update_pot_view_target_watch(sdk::UGameEngine* engine) {
+    if (!is_path_of_titans_executable()) {
+        return;
+    }
+
+    const auto pcm = get_primary_player_camera_manager(engine);
+    std::wstring name = L"(none)";
+    sdk::UObject* target_object = nullptr;
+
+    if (const auto target = read_pcm_view_target(pcm); target.has_value() && *target != nullptr) {
+        target_object = *target;
+        const auto klass = target_object->get_class();
+        name = klass != nullptr ? klass->get_name_safe() : L"<unknown class>";
+        name += L" | ";
+        name += target_object->get_full_name();
+    }
+
+    bool changed = false;
+
+    {
+        std::scoped_lock lock{m_pot_view_target_mutex};
+        changed = name != m_pot_view_target_previous;
+        if (changed) {
+            m_pot_view_target_previous = name;
+        }
+        m_pot_view_target_current = name;
+    }
+
+    if (changed) {
+        ++m_pot_view_target_changes_total;
+        ++m_pot_view_target_changes_since_log;
+    }
+
+    // Locations are the real story: the ViewTarget may stay on the pawn while
+    // the game teleports the pawn (or the whole camera) to the select area,
+    // and vice versa. Log both anchors plus the distance between them.
+    const auto actor_location = [](sdk::UObject* object) -> std::string {
+        try {
+            if (object == nullptr || !object->is_a(sdk::AActor::static_class())) {
+                return "n/a";
+            }
+
+            const auto actor = (sdk::AActor*)object;
+            const auto location = actor->get_actor_location();
+
+            if (!std::isfinite(location.x) || !std::isfinite(location.y) || !std::isfinite(location.z)) {
+                return "nan";
+            }
+
+            return std::format("({:.0f}, {:.0f}, {:.0f})", location.x, location.y, location.z);
+        } catch (...) {
+            return "err";
+        }
+    };
+
+    std::string pawn_location = "n/a";
+    sdk::UObject* pawn_object = nullptr;
+    sdk::APlayerController* player_controller = nullptr;
+
+    try {
+        const auto world = engine != nullptr ? engine->get_world() : nullptr;
+        const auto gameplay = sdk::UGameplayStatics::get();
+
+        if (world != nullptr && gameplay != nullptr) {
+            player_controller = gameplay->get_player_controller(world, 0);
+
+            if (player_controller != nullptr) {
+                uint8_t params[8]{};
+                player_controller->call_function(L"GetPawn", params);
+
+                const auto candidate = (sdk::UObject*)params[0];
+
+                if (candidate != nullptr && !IsBadReadPtr(candidate, sizeof(void*) * 4)) {
+                    pawn_object = candidate;
+                    pawn_location = actor_location(pawn_object);
+                }
+            }
+        }
+    } catch (...) {
+        pawn_location = "err";
+    }
+
+    // UMG dialogs (character view, inventory, chat...) take the mouse cursor
+    // and lock input. These two PlayerController bools are the cheapest
+    // generic "a dialog is open" signal; also used for the [PoT][UISignal]
+    // telemetry lines to validate against the reported camera break.
+    bool cursor_visible = false;
+    bool cursor_known = false;
+    bool input_locked = false;
+    bool input_lock_known = false;
+
+    if (player_controller != nullptr) {
+        try {
+            const auto pc_class = player_controller->get_class();
+
+            if (const auto prop = get_bool_property_descriptor(pc_class, L"bShowCursor"); prop != nullptr) {
+                cursor_visible = prop->get_value_from_object((void*)player_controller);
+                cursor_known = true;
+            }
+
+            if (const auto prop = get_bool_property_descriptor(pc_class, L"bInputLocked"); prop != nullptr) {
+                input_locked = prop->get_value_from_object((void*)player_controller);
+                input_lock_known = true;
+            }
+        } catch (...) {
+        }
+    }
+
+    m_pot_cursor_known = cursor_known;
+    m_pot_input_lock_known = input_lock_known;
+
+    const auto now = std::chrono::steady_clock::now();
+
+    if (cursor_known && cursor_visible != m_pot_cursor_last) {
+        if (m_pot_cursor_change_last_log.time_since_epoch().count() == 0 ||
+            now - m_pot_cursor_change_last_log >= std::chrono::milliseconds(500)) {
+            m_pot_cursor_change_last_log = now;
+            spdlog::info("[PoT][UISignal] bShowCursor {} -> {} (bInputLocked {})",
+                m_pot_cursor_last, cursor_visible, input_locked);
+        }
+
+        m_pot_cursor_last = cursor_visible;
+    }
+
+    if (input_lock_known && input_locked != m_pot_input_lock_last) {
+        if (m_pot_cursor_change_last_log.time_since_epoch().count() == 0 ||
+            now - m_pot_cursor_change_last_log >= std::chrono::milliseconds(500)) {
+            m_pot_cursor_change_last_log = now;
+            spdlog::info("[PoT][UISignal] bInputLocked {} -> {} (bShowCursor {})",
+                m_pot_input_lock_last, input_locked, cursor_visible);
+        }
+
+        m_pot_input_lock_last = input_locked;
+    }
+
+    // Optional: while a dialog is open, hand the headset a flat 2D image of
+    // the game window instead of the (broken) stereo world. Restores the
+    // user's own 2D setting when the dialog closes, with a short debounce so
+    // quick close/reopen sequences do not thrash the mode.
+    if (m_pot_dialog_force_2d->value() && cursor_known) {
+        if (cursor_visible) {
+            m_pot_auto2d_off_since = {};
+
+            if (!m_pot_auto2d_engaged) {
+                m_pot_auto2d_engaged = true;
+                m_pot_auto2d_previous = m_2d_screen_mode->value();
+
+                if (!m_2d_screen_mode->value()) {
+                    m_2d_screen_mode->value() = true;
+                }
+
+                spdlog::info("[PoT][Auto2D] engaged (dialog open); previous 2D={}", m_pot_auto2d_previous);
+            }
+        }
+        else if (m_pot_auto2d_engaged) {
+            if (m_pot_auto2d_off_since.time_since_epoch().count() == 0) {
+                m_pot_auto2d_off_since = now;
+            }
+            else if (now - m_pot_auto2d_off_since >= std::chrono::milliseconds(400)) {
+                m_pot_auto2d_engaged = false;
+                m_pot_auto2d_off_since = {};
+
+                if (m_2d_screen_mode->value() != m_pot_auto2d_previous) {
+                    m_2d_screen_mode->value() = m_pot_auto2d_previous;
+                }
+
+                spdlog::info("[PoT][Auto2D] released (dialog closed); restored 2D={}", m_pot_auto2d_previous);
+            }
+        }
+    }
+    else if (m_pot_auto2d_engaged) {
+        m_pot_auto2d_engaged = false;
+        m_pot_auto2d_off_since = {};
+
+        if (m_2d_screen_mode->value() != m_pot_auto2d_previous) {
+            m_2d_screen_mode->value() = m_pot_auto2d_previous;
+        }
+
+        spdlog::info("[PoT][Auto2D] released (setting off); restored 2D={}", m_pot_auto2d_previous);
+    }
+
+    double separation = -1.0;
+
+    try {
+        if (pawn_object != nullptr && target_object != nullptr
+            && target_object->is_a(sdk::AActor::static_class())
+            && pawn_object->is_a(sdk::AActor::static_class())) {
+            const auto a = ((sdk::AActor*)target_object)->get_actor_location();
+            const auto b = ((sdk::AActor*)pawn_object)->get_actor_location();
+            const auto dx = a.x - b.x;
+            const auto dy = a.y - b.y;
+            const auto dz = a.z - b.z;
+            separation = std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+    } catch (...) {
+        separation = -1.0;
+    }
+
+    // The ViewTarget can stay perfectly stable while the actual render POV
+    // jumps around every frame (character-view bug), so measure the live
+    // camera location itself. UE5 marshals FVector as three doubles.
+    std::string cam_loc_str = "n/a";
+    bool cam_jump = false;
+    double cam_loc[3]{};
+
+    if (pcm != nullptr) {
+        try {
+            uint8_t params[48]{};
+            pcm->call_function(L"GetCameraLocation", params);
+            const auto v = (const double*)params;
+
+            if (std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2])) {
+                cam_loc[0] = v[0];
+                cam_loc[1] = v[1];
+                cam_loc[2] = v[2];
+                cam_loc_str = std::format("({:.0f}, {:.0f}, {:.0f})", cam_loc[0], cam_loc[1], cam_loc[2]);
+
+                if (m_pot_cam_loc_valid) {
+                    const auto dx = cam_loc[0] - m_pot_cam_loc_prev[0];
+                    const auto dy = cam_loc[1] - m_pot_cam_loc_prev[1];
+                    const auto dz = cam_loc[2] - m_pot_cam_loc_prev[2];
+                    const auto dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+                    // 10 m in one tick: sprinting dino moves < 1 m/tick;
+                    // anything above this is a teleport or two-camera fight.
+                    if (dist > 1000.0) {
+                        cam_jump = true;
+                        ++m_pot_cam_jumps_total;
+
+                        if (m_pot_cam_jump_last_log.time_since_epoch().count() == 0 ||
+                            now - m_pot_cam_jump_last_log >= std::chrono::seconds(1)) {
+                            m_pot_cam_jump_last_log = now;
+                            spdlog::info(
+                                "[PoT][ViewTarget] CAMERA POSITION JUMP #{} over {:.0f} cm: {} -> {}",
+                                m_pot_cam_jumps_total,
+                                dist,
+                                std::format("({:.0f}, {:.0f}, {:.0f})", m_pot_cam_loc_prev[0], m_pot_cam_loc_prev[1], m_pot_cam_loc_prev[2]),
+                                cam_loc_str);
+                        }
+                    }
+                }
+
+                m_pot_cam_loc_prev[0] = cam_loc[0];
+                m_pot_cam_loc_prev[1] = cam_loc[1];
+                m_pot_cam_loc_prev[2] = cam_loc[2];
+                m_pot_cam_loc_valid = true;
+            }
+        } catch (...) {
+            cam_loc_str = "err";
+        }
+    }
+
+    // Fingerprint every camera cache the engine holds. When a UI/dialog drives a
+    // second view, these caches diverge: the render view vs the last-frame view
+    // is exactly the "two camera views" the user sees flipping. Sample them all
+    // and report the pairwise spread. UE5 stores FVector as three doubles.
+    std::string cache_str;
+    double cache_max_spread = 0.0;
+    bool cache_split = false;
+
+    if (resolve_game_fov_offsets()) {
+        struct CacheProbe {
+            const char* label;
+            int32_t offset;
+        };
+
+        const CacheProbe probes[] = {
+            {"priv", g_game_fov_resolver.camera_cache_private_offset},
+            {"pub", g_game_fov_resolver.camera_cache_offset},
+            {"lastPriv", g_game_fov_resolver.last_frame_camera_cache_private_offset},
+            {"lastPub", g_game_fov_resolver.last_frame_camera_cache_offset},
+        };
+
+        double last_valid[3]{0.0, 0.0, 0.0};
+        bool have_last_valid = false;
+
+        for (const auto& probe : probes) {
+            if (probe.offset <= 0) {
+                cache_str += std::format(" {}=n/a", probe.label);
+                continue;
+            }
+
+            const auto vec_base = (const double*)((const uint8_t*)pcm + probe.offset +
+                g_game_fov_resolver.pov_offset + g_game_fov_resolver.location_offset);
+
+            const double cx = vec_base[0];
+            const double cy = vec_base[1];
+            const double cz = vec_base[2];
+
+            if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(cz)) {
+                cache_str += std::format(" {}=nan", probe.label);
+                continue;
+            }
+
+            float fov = 0.0f;
+            const auto fov_base = (const float*)((const uint8_t*)pcm + probe.offset +
+                g_game_fov_resolver.pov_offset + g_game_fov_resolver.fov_offset);
+            fov = *fov_base;
+
+            cache_str += std::format(" {}=({:.0f},{:.0f},{:.0f} f{:.0f})", probe.label, cx, cy, cz, fov);
+
+            if (have_last_valid) {
+                const auto dx = cx - last_valid[0];
+                const auto dy = cy - last_valid[1];
+                const auto dz = cz - last_valid[2];
+                const auto spread = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+                if (spread > cache_max_spread) {
+                    cache_max_spread = spread;
+                }
+            }
+
+            last_valid[0] = cx;
+            last_valid[1] = cy;
+            last_valid[2] = cz;
+            have_last_valid = true;
+        }
+
+        // More than 5 m divergence between the engine's own camera caches means
+        // two different cameras are live at once - the signature of this bug.
+        cache_split = cache_max_spread > 500.0;
+
+        if (cache_split && (m_pot_view_target_last_log.time_since_epoch().count() == 0 ||
+            now - m_pot_cam_jump_last_log >= std::chrono::seconds(1))) {
+            m_pot_cam_jump_last_log = now;
+            spdlog::info("[PoT][ViewTarget] CAMERA CACHE SPLIT spread={:.0f}cm{}", cache_max_spread, cache_str);
+        }
+    }
+
+    // First log line at least every 2s even when nothing changes (heartbeat):
+    // the camera break may move the anchors while the ViewTarget stays put.
+    const bool heartbeat = m_pot_view_target_last_log.time_since_epoch().count() == 0
+        || now - m_pot_view_target_last_log >= std::chrono::seconds(2);
+
+    if (changed || heartbeat) {
+        m_pot_view_target_last_log = now;
+        spdlog::info("[PoT][ViewTarget] {} '{}' targetLoc={} camLoc={} pawnLoc={} sep={:.0f} camJumps={} cursor={} lock={} cache={} cacheSplit={} ({} change(s) since last log, {} total)",
+            changed ? "now" : "hold",
+            utility::narrow(name),
+            actor_location(target_object),
+            cam_loc_str,
+            pawn_location,
+            separation,
+            m_pot_cam_jumps_total,
+            cursor_known ? (cursor_visible ? "visible" : "hidden") : "unknown",
+            input_lock_known ? (input_locked ? "locked" : "free") : "unknown",
+            cache_str,
+            cache_split,
+            m_pot_view_target_changes_since_log,
+            m_pot_view_target_changes_total.load());
+        m_pot_view_target_changes_since_log = 0;
+
+        // The primary PCM can look perfectly calm while a second camera source
+        // (extra PlayerCameraManager from a dialog-local player, or a transient
+        // SceneCaptureComponent2D) fights for the same backbuffer. Enumerate
+        // every candidate source on the heartbeat to catch that.
+        std::string aux{};
+
+        try {
+            const auto pcm_list = get_live_objects_by_class_name(L"Class /Script/Engine.PlayerCameraManager");
+            aux += std::format("PCM x{}:", pcm_list.size());
+
+            for (size_t i = 0; i < pcm_list.size() && i < 6; ++i) {
+                std::string loc = "?";
+
+                try {
+                    uint8_t params[48]{};
+                    pcm_list[i]->call_function(L"GetCameraLocation", params);
+                    const auto v = (const double*)params;
+
+                    if (std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2])) {
+                        loc = std::format("({:.0f},{:.0f},{:.0f})", v[0], v[1], v[2]);
+                    }
+                } catch (...) {
+                }
+
+                aux += std::format("{} {}@{}", i > 0 ? "|" : "", utility::narrow(pcm_list[i]->get_name_safe()), loc);
+            }
+        } catch (...) {
+            aux += "PCM err";
+        }
+
+        try {
+            const auto cap_list = get_live_objects_by_class_name(L"Class /Script/Engine.SceneCaptureComponent2D");
+            size_t transient_captures{};
+            std::string cap_names{};
+
+            for (const auto capture : cap_list) {
+                const auto full = capture->get_full_name();
+
+                if (full.find(L"/Engine/Transient") == std::wstring::npos) {
+                    continue;
+                }
+
+                ++transient_captures;
+
+                if (cap_names.size() < 240) {
+                    if (!cap_names.empty()) {
+                        cap_names += ", ";
+                    }
+
+                    cap_names += utility::narrow(full);
+                }
+            }
+
+            aux += std::format(" | transientCaptures={} [{}]", transient_captures, cap_names);
+        } catch (...) {
+            aux += " | captures err";
+        }
+
+        spdlog::info("[PoT][CamSource] {}", aux);
+    }
+}
+
+void VR::dump_pot_active_widgets() {
+    ZoneScopedN(__FUNCTION__);
+
+    try {
+        const auto dir = Framework::get_persistent_dir();
+
+        // Incrementing file name: widgets_001.txt, widgets_002.txt, ...
+        int next_index = 1;
+        std::error_code ec{};
+
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            const auto filename = entry.path().filename().string();
+
+            if (!filename.starts_with("widgets_") || !filename.ends_with(".txt")) {
+                continue;
+            }
+
+            const auto digits = filename.substr(
+                sizeof("widgets_") - 1,
+                filename.size() - (sizeof("widgets_") - 1) - (sizeof(".txt") - 1));
+
+            if (digits.empty() ||
+                !std::all_of(digits.begin(), digits.end(), [](char c) { return std::isdigit((unsigned char)c) != 0; })) {
+                continue;
+            }
+
+            next_index = std::max(next_index, std::stoi(digits) + 1);
+        }
+
+        const auto path = dir / std::format("widgets_{:03}.txt", next_index);
+
+        std::ofstream file{path};
+
+        if (!file) {
+            spdlog::error("[PoT][Widgets] Failed to open {} for writing", path.string());
+            return;
+        }
+
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+
+        file << "UEVR live widget dump\n";
+        file << std::format("Time: {:04}-{:02}-{:02} {:02}:{:02}:{:02}\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+        const auto object_array = sdk::FUObjectArray::get();
+
+        if (object_array == nullptr) {
+            spdlog::warn("[PoT][Widgets] No object array; nothing to dump");
+            return;
+        }
+
+        const auto object_count = object_array->get_object_count();
+        size_t scanned{};
+        size_t written{};
+
+        for (auto i = 0; i < object_count; ++i) {
+            const auto item = object_array->get_object(i);
+
+            if (item == nullptr) {
+                continue;
+            }
+
+            const auto object = item->get_object();
+
+            if (object == nullptr || IsBadReadPtr(object, sizeof(void*) * 4) || object->is_pending_kill_or_unreachable()) {
+                continue;
+            }
+
+            ++scanned;
+
+            const auto uobject = (sdk::UObject*)object;
+            auto klass = uobject->get_class();
+
+            if (klass == nullptr) {
+                continue;
+            }
+
+            bool is_user_widget = false;
+
+            for (auto depth = 0; klass != nullptr && depth < 16; ++depth) {
+                if (klass->get_name_safe() == L"UserWidget") {
+                    is_user_widget = true;
+                    break;
+                }
+
+                klass = (sdk::UClass*)klass->get_super_struct();
+            }
+
+            if (!is_user_widget) {
+                continue;
+            }
+
+            const auto full_name = uobject->get_full_name();
+
+            if (full_name.find(L"Default__") != std::wstring::npos) {
+                continue;
+            }
+
+            const auto widget_class = uobject->get_class();
+            auto visibility = -1;
+
+            // -1: GetVisibility unavailable, 0: Visible, 1: SelfHitTestInvisible,
+            // 2: HitTestInvisible, 3: Collapsed, 4: Hidden.
+            if (widget_class != nullptr && widget_class->find_function(L"GetVisibility") != nullptr) {
+                try {
+                    uint8_t params[8]{};
+                    uobject->call_function(L"GetVisibility", params);
+                    visibility = (int)params[0];
+                } catch (...) {
+                    visibility = -1;
+                }
+            }
+
+            file << std::format("vis={} class='{}' '{}'\n",
+                visibility,
+                utility::narrow(widget_class != nullptr ? widget_class->get_name_safe() : std::wstring{L"<unknown>"}),
+                utility::narrow(full_name));
+
+            ++written;
+        }
+
+        file << std::format("\nScanned {} objects, {} live user widgets\n", scanned, written);
+
+        m_last_widget_dump = path;
+
+        spdlog::info("[PoT][Widgets] Wrote {} live widgets to {}", written, path.string());
+    } catch (const std::exception& e) {
+        spdlog::warn("[PoT][Widgets] Dump failed: {}", e.what());
+    } catch (...) {
+        spdlog::warn("[PoT][Widgets] Dump failed (unknown exception)");
+    }
+}
+
 // Finds the dynamic material instance used by a UImage brush
 // (WidgetStyle -> ResourceObject), if any. Offsets resolved once via
 // reflection against the widget's own class.
@@ -11011,6 +11560,27 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
         ImGui::SameLine();
         ImGui::TextWrapped("Writes damage_props_NNN.txt: capture once with no damage, again while damaged, then diff.");
+
+        std::wstring view_target_name{};
+        {
+            std::scoped_lock lock{m_pot_view_target_mutex};
+            view_target_name = m_pot_view_target_current;
+        }
+        ImGui::TextWrapped("Camera ViewTarget: %s (%u changes)", utility::narrow(view_target_name).c_str(),
+            m_pot_view_target_changes_total.load());
+
+        if (ImGui::Button("Dump Active Widgets")) {
+            dump_pot_active_widgets();
+        }
+
+        ImGui::SameLine();
+        if (!m_last_widget_dump.empty()) {
+            ImGui::TextWrapped("Last widget dump: %s", m_last_widget_dump.filename().string().c_str());
+        } else {
+            ImGui::TextWrapped("Writes widgets_NNN.txt: capture once normally, again with the dialog open, then diff.");
+        }
+
+        m_pot_dialog_force_2d->draw("Force 2D While Dialog Open (cursor visible)");
 
         m_pot_motion_vignette_enabled->draw("Vignette On Camera Rotation");
         if (m_pot_motion_vignette_enabled->value()) {
