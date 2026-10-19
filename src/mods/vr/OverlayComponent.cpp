@@ -1310,7 +1310,7 @@ cbuffer VignetteParams : register(b0) {
     float g_start;
     float g_end;
     float g_solid;
-    float g_pad;
+    float g_gain;
 };
 
 struct PSOut {
@@ -1329,6 +1329,10 @@ PSOut ps_main(float4 pos : SV_Position) {
         float t = (dist - g_start) / max(g_end - g_start, 0.0001f);
         t = saturate(t);
         s = t * t * (3.0f - 2.0f * t);
+        // Gain > 1 pushes the falloff outward, darkening more of the screen;
+        // overlay alpha itself saturates at 1, so texture alpha is the only
+        // remaining strength axis.
+        s = saturate(s * max(g_gain, 1.0f));
     }
 
     PSOut o;
@@ -1449,10 +1453,33 @@ PSOut ps_main(float4 pos : SV_Position) {
     return true;
 }
 
-bool OverlayComponent::ensure_pot_vignette_texture_dx12() {
+bool OverlayComponent::ensure_pot_vignette_texture_dx12(int slot, float gain) {
+    if (slot < 0 || slot >= POT_VIGNETTE_SLOT_COUNT) {
+        return false;
+    }
+
     const auto start = m_pot_vignette_start->value();
     const auto end = m_pot_vignette_end->value();
     const bool solid = m_pot_vignette_solid_debug->value();
+
+    gain = std::max(gain, 1.0f);
+
+    // Shape knobs are shared by all slots; bump a version counter so every
+    // slot re-renders once after a shape change.
+    if (start != m_pot_vignette_last_start || end != m_pot_vignette_last_end || solid != m_pot_vignette_last_solid) {
+        m_pot_vignette_last_start = start;
+        m_pot_vignette_last_end = end;
+        m_pot_vignette_last_solid = solid;
+        ++m_pot_vignette_shape_version;
+    }
+
+    auto& ctx = m_pot_vignette_ctx[slot];
+    const bool texture_exists = ctx.texture != nullptr;
+
+    if (texture_exists && m_pot_vignette_slot_shape_version[slot] == m_pot_vignette_shape_version
+        && gain == m_pot_vignette_last_gain[slot]) {
+        return true; // idle: no CPU or GPU work at all
+    }
 
     const auto device = g_framework->get_d3d12_hook()->get_device();
     if (device == nullptr) {
@@ -1462,13 +1489,11 @@ bool OverlayComponent::ensure_pot_vignette_texture_dx12() {
 
     constexpr uint32_t SIZE = 512;
 
-    bool needs_render = false;
+    if (!build_pot_vignette_pipeline_dx12(device)) {
+        return false;
+    }
 
-    if (m_pot_vignette_ctx.texture == nullptr) {
-        if (!build_pot_vignette_pipeline_dx12(device)) {
-            return false;
-        }
-
+    if (!texture_exists) {
         // Render-target-capable texture in the same resource style the OpenVR
         // UI texture uses for compositor submission.
         D3D12_RESOURCE_DESC tex_desc{};
@@ -1492,28 +1517,17 @@ bool OverlayComponent::ensure_pot_vignette_texture_dx12() {
         if (FAILED(device->CreateCommittedResource(
                 &default_heap, D3D12_HEAP_FLAG_NONE, &tex_desc,
                 D3D12_RESOURCE_STATE_RENDER_TARGET, &clear_value, IID_PPV_ARGS(&tex)))) {
-            SPDLOG_ERROR("[PotVignette] failed to create vignette texture");
+            SPDLOG_ERROR("[PotVignette] failed to create vignette texture (slot {})", slot);
             return false;
         }
 
-        if (!m_pot_vignette_ctx.setup(device, tex.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, L"PotVignetteTexture")) {
-            SPDLOG_ERROR("[PotVignette] failed to set up vignette texture context");
-            m_pot_vignette_ctx.reset();
+        if (!ctx.setup(device, tex.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, L"PotVignetteTexture")) {
+            SPDLOG_ERROR("[PotVignette] failed to set up vignette texture context (slot {})", slot);
+            ctx.reset();
             return false;
         }
 
-        m_pot_vignette_in_psr = false;
-        needs_render = true;
-    } else {
-        needs_render = start != m_pot_vignette_last_start || end != m_pot_vignette_last_end || solid != m_pot_vignette_last_solid;
-
-        if (!needs_render) {
-            return true; // idle: no CPU or GPU work at all
-        }
-
-        if (!build_pot_vignette_pipeline_dx12(device)) {
-            return false;
-        }
+        m_pot_vignette_in_psr[slot] = false;
     }
 
     d3d12::CommandContext render_ctx{};
@@ -1527,17 +1541,17 @@ bool OverlayComponent::ensure_pot_vignette_texture_dx12() {
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-    barrier.Transition.pResource = m_pot_vignette_ctx.texture.Get();
+    barrier.Transition.pResource = ctx.texture.Get();
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-    if (m_pot_vignette_in_psr) {
+    if (m_pot_vignette_in_psr[slot]) {
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         cmd->ResourceBarrier(1, &barrier);
     }
 
     const float clear_color[4]{1.0f, 1.0f, 1.0f, 0.0f};
-    const auto rtv = m_pot_vignette_ctx.get_rtv();
+    const auto rtv = ctx.get_rtv();
     cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     cmd->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
 
@@ -1550,7 +1564,7 @@ bool OverlayComponent::ensure_pot_vignette_texture_dx12() {
     cmd->SetPipelineState(m_pot_vignette_pso.Get());
     cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    const float params[4]{start, end, solid ? 1.0f : 0.0f, 0.0f};
+    const float params[4]{start, end, solid ? 1.0f : 0.0f, gain};
     cmd->SetGraphicsRoot32BitConstants(0, 4, params, 0);
     cmd->DrawInstanced(3, 1, 0, 0);
 
@@ -1564,12 +1578,11 @@ bool OverlayComponent::ensure_pot_vignette_texture_dx12() {
     render_ctx.execute();
     render_ctx.wait(INFINITE);
 
-    m_pot_vignette_in_psr = true;
-    m_pot_vignette_last_start = start;
-    m_pot_vignette_last_end = end;
-    m_pot_vignette_last_solid = solid;
+    m_pot_vignette_in_psr[slot] = true;
+    m_pot_vignette_last_gain[slot] = gain;
+    m_pot_vignette_slot_shape_version[slot] = m_pot_vignette_shape_version;
 
-    SPDLOG_INFO("[PotVignette] falloff rendered on GPU [{}x{} start={} end={} solid={}]", SIZE, SIZE, start, end, solid);
+    SPDLOG_INFO("[PotVignette] falloff rendered on GPU [slot {} start={} end={} solid={} gain={}]", slot, start, end, solid, gain);
     return true;
 }
 
@@ -1602,17 +1615,9 @@ void OverlayComponent::update_pot_vignette_pool_openvr() {
         return;
     }
 
-    // failure backoff: retry the upload at most every 1s while broken
+    // failure backoff: retry failed slots at most every 1s while broken
     const auto now = std::chrono::steady_clock::now();
     if (m_pot_vignette_fail_backoff > now) {
-        return;
-    }
-
-    if (!ensure_pot_vignette_texture_dx12()) {
-        m_pot_vignette_fail_backoff = now + std::chrono::milliseconds(1000);
-        for (auto slot = 0; slot < POT_VIGNETTE_SLOT_COUNT; ++slot) {
-            hide_slot(slot);
-        }
         return;
     }
 
@@ -1651,6 +1656,14 @@ void OverlayComponent::update_pot_vignette_pool_openvr() {
             continue;
         }
 
+        // Slot texture carries the gain (>1 intensity widens the darkened
+        // region; compositor alpha itself saturates at 1).
+        if (!ensure_pot_vignette_texture_dx12(slot, alpha)) {
+            m_pot_vignette_fail_backoff = now + std::chrono::milliseconds(1000);
+            hide_slot(slot);
+            continue;
+        }
+
         float r{};
         float g{};
         float b{};
@@ -1677,7 +1690,7 @@ void OverlayComponent::update_pot_vignette_pool_openvr() {
             spdlog::info("[PotVignette] slot {} showing (alpha={:.3f})", slot, alpha);
         }
         check("SetOverlayColor", vr::VROverlay()->SetOverlayColor(handle, r, g, b));
-        check("SetOverlayAlpha", vr::VROverlay()->SetOverlayAlpha(handle, std::max(alpha, 0.0f)));
+        check("SetOverlayAlpha", vr::VROverlay()->SetOverlayAlpha(handle, std::clamp(alpha, 0.0f, 1.0f)));
         check("SetOverlayWidthInMeters", vr::VROverlay()->SetOverlayWidthInMeters(handle, m_pot_vignette_size->value()));
 
         auto glm_matrix = head_rotation;
@@ -1689,7 +1702,7 @@ void OverlayComponent::update_pot_vignette_pool_openvr() {
         check("SetOverlayTransformAbsolute", vr::VROverlay()->SetOverlayTransformAbsolute(handle, vr::TrackingUniverseStanding, (vr::HmdMatrix34_t*)&steamvr_matrix));
 
         vr::D3D12TextureData_t texture_data{
-            m_pot_vignette_ctx.texture.Get(),
+            m_pot_vignette_ctx[slot].texture.Get(),
             g_framework->get_d3d12_hook()->get_command_queue(),
             0
         };

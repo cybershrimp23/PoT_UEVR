@@ -127,15 +127,19 @@ private:
 
     vr::VROverlayHandle_t m_pot_vignette_handles[POT_VIGNETTE_SLOT_COUNT]{};
 
-    // GPU-rendered vignette falloff: 512x512 render-target texture refilled by
-    // a fullscreen-triangle pixel shader whenever Start/End/SolidDebug change.
-    d3d12::TextureContext m_pot_vignette_ctx{};
+    // GPU-rendered vignette falloff: one render-target texture per slot so
+    // each overlay can carry its own intensity gain; refilled by a
+    // fullscreen-triangle pixel shader whenever shape or gain changes.
+    d3d12::TextureContext m_pot_vignette_ctx[POT_VIGNETTE_SLOT_COUNT]{};
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_pot_vignette_root_sig{};
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_pot_vignette_pso{};
     float m_pot_vignette_last_start{-1.0f};
     float m_pot_vignette_last_end{-1.0f};
     bool m_pot_vignette_last_solid{false};
-    bool m_pot_vignette_in_psr{false};
+    int32_t m_pot_vignette_shape_version{0};
+    std::array<int32_t, POT_VIGNETTE_SLOT_COUNT> m_pot_vignette_slot_shape_version{{-1, -1, -1, -1}};
+    float m_pot_vignette_last_gain[POT_VIGNETTE_SLOT_COUNT]{};
+    bool m_pot_vignette_in_psr[POT_VIGNETTE_SLOT_COUNT]{};
 
     std::array<std::atomic<float>, POT_VIGNETTE_SLOT_COUNT> m_pot_vignette_alphas{{}};
     std::array<bool, POT_VIGNETTE_SLOT_COUNT> m_pot_vignette_shown{};
@@ -292,7 +296,7 @@ private:
     void update_overlay_openvr();
     bool update_wrist_overlay_openvr();
     void update_slate_openvr();
-    bool ensure_pot_vignette_texture_dx12();
+    bool ensure_pot_vignette_texture_dx12(int slot, float gain);
     bool build_pot_vignette_pipeline_dx12(ID3D12Device* device);
     void update_pot_vignette_pool_openvr();
 };}
