@@ -33,6 +33,11 @@ public:
     void spawn_console();
     void process_stalker2_sharpen_priority();
 
+    // Path of Titans ambient occlusion mode switching: VR consumes these to
+    // fire exactly one runtime reinitialize after a mid-session preset pass.
+    bool pot_ao_reinit_requested() const { return m_pot_ao_reinit_requested; }
+    void clear_pot_ao_reinit_requested() { m_pot_ao_reinit_requested = false; }
+
     void execute_console_script(sdk::UGameEngine* engine, const std::string& filename);
 
     struct ChangeSnapshot {
@@ -270,6 +275,9 @@ private:
     int m_windrose_shadow_runtime_cvar_attempts{0};
     bool m_pot_ao_lumen_runtime_cvars_done{false};
     int m_pot_ao_lumen_runtime_cvar_attempts{0};
+    int m_pot_ao_applied_mode{-1};
+    bool m_pot_ao_reinit_pending{false};
+    bool m_pot_ao_reinit_requested{false};
 
     static inline std::mutex s_change_mutex{};
     static inline std::atomic_uint64_t s_change_counter{};

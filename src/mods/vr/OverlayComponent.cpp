@@ -1600,7 +1600,7 @@ bool OverlayComponent::ensure_pot_vignette_texture_dx12(int slot, float gain) {
     m_pot_vignette_last_gain[slot] = gain;
     m_pot_vignette_slot_shape_version[slot] = m_pot_vignette_shape_version;
 
-    SPDLOG_INFO("[PotVignette] falloff rendered on GPU [slot {} start={} end={} solid={} gain={}]", slot, start, end, solid, gain);
+    SPDLOG_INFO_EVERY_N_SEC(5, "[PotVignette] falloff rendered on GPU [slot {} start={} end={} solid={} gain={}]", slot, start, end, solid, gain);
     return true;
 }
 
@@ -1653,7 +1653,11 @@ void OverlayComponent::update_pot_vignette_pool_openvr() {
 
         const auto alpha = m_pot_vignette_alphas[slot].load(std::memory_order_relaxed);
 
-        if (slot_enabled && alpha > 0.002f) {
+        // Small show/hide hysteresis: hovering near the zero boundary would
+        // otherwise flip showing/hidden (log + OpenVR churn) repeatedly.
+        const auto show_threshold = m_pot_vignette_shown[slot] ? 0.002f : 0.02f;
+
+        if (slot_enabled && alpha > show_threshold) {
             any_slot_active = true;
             break;
         }
@@ -1697,7 +1701,10 @@ void OverlayComponent::update_pot_vignette_pool_openvr() {
 
         const auto alpha = m_pot_vignette_alphas[slot].load(std::memory_order_relaxed);
 
-        if (!slot_enabled || alpha <= 0.002f) {
+        // Same hysteresis as the idle fast path above.
+        const auto show_threshold = m_pot_vignette_shown[slot] ? 0.002f : 0.02f;
+
+        if (!slot_enabled || alpha <= show_threshold) {
             hide_slot(slot);
             continue;
         }

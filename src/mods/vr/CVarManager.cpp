@@ -558,10 +558,11 @@ bool force_pot_ao_lumen_runtime_cvars_once(int attempt) {
     };
 
     // Path of Titans' per-eye SSAO/TAA shimmer makes the world unreadable in
-    // stereo. The validated preset is the full Lumen path: view-independent
-    // ray GI replaces screen-space AO, SSAO is off, and AA is disabled so the
-    // two eyes cannot diverge. No partial preset has worked for this title.
-    static constexpr std::array forced_cvars{
+    // stereo. "Ambient Occlusion" applies the validated full Lumen path:
+    // view-independent ray GI replaces screen-space AO, SSAO is off, and AA is
+    // disabled so the two eyes cannot diverge. "No Ambient Occlusion" just
+    // kills every AO pass and leaves everything else at the game's defaults.
+    static constexpr std::array forced_cvars_lumen{
         ForcedCVar{L"r.AntiAliasingMethod", L"0"},
         ForcedCVar{L"r.DynamicGlobalIlluminationMethod", L"1"},
         ForcedCVar{L"r.Lumen.ScreenProbeGather.RadianceCache.ProbeResolution", L"32"},
@@ -569,12 +570,25 @@ bool force_pot_ao_lumen_runtime_cvars_once(int attempt) {
         ForcedCVar{L"r.SSAO.Quality", L"0"},
     };
 
+    static constexpr std::array forced_cvars_none{
+        ForcedCVar{L"r.AmbientOcclusionLevels", L"0"},
+        ForcedCVar{L"r.SSAO.Quality", L"0"},
+    };
+
+    const auto vr = VR::get();
+    const int32_t mode = vr ? vr->pot_ao_mode() : 1;
+    const bool no_ao = (mode == 0);
+
+    const ForcedCVar* forced_list = no_ao ? forced_cvars_none.data() : forced_cvars_lumen.data();
+    const size_t forced_count = no_ao ? forced_cvars_none.size() : forced_cvars_lumen.size();
+
     int found{};
     int set_ok{};
     int set_failed{};
     int missing{};
 
-    for (const auto& forced : forced_cvars) {
+    for (size_t forced_index = 0; forced_index < forced_count; ++forced_index) {
+        const auto& forced = forced_list[forced_index];
         auto object = console_manager->find(forced.name);
 
         if (object == nullptr) {
@@ -617,8 +631,9 @@ bool force_pot_ao_lumen_runtime_cvars_once(int attempt) {
     }
 
     SPDLOG_INFO(
-        "[PoT][AO/Lumen] preset pass complete attempt={} found={} missing={} set_ok={} set_failed={}",
+        "[PoT][AO/Lumen] preset pass complete attempt={} mode={} found={} missing={} set_ok={} set_failed={}",
         attempt,
+        mode,
         found,
         missing,
         set_ok,
@@ -962,11 +977,34 @@ void CVarManager::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
         }
     }
 
+    if (m_pot_ao_lumen_runtime_cvars_done && m_pot_ao_applied_mode >= 0) {
+        const auto vr = VR::get();
+        const int32_t pot_mode_now = vr ? vr->pot_ao_mode() : 1;
+
+        // The user flipped the Ambient Occlusion combo: re-apply the matching
+        // preset immediately, then request one runtime reinitialize so the
+        // render graph is recreated with the new cvars (whether that fully
+        // switches Lumen on/off mid-session is exactly what we're testing).
+        if (pot_mode_now != m_pot_ao_applied_mode) {
+            m_pot_ao_lumen_runtime_cvars_done = false;
+            m_pot_ao_lumen_runtime_cvar_attempts = 0;
+            m_pot_ao_reinit_pending = true;
+        }
+    }
+
     if (!m_pot_ao_lumen_runtime_cvars_done) {
         ++m_pot_ao_lumen_runtime_cvar_attempts;
 
         if (force_pot_ao_lumen_runtime_cvars_once(m_pot_ao_lumen_runtime_cvar_attempts)) {
             m_pot_ao_lumen_runtime_cvars_done = true;
+
+            const auto vr = VR::get();
+            m_pot_ao_applied_mode = vr ? vr->pot_ao_mode() : 1;
+
+            if (m_pot_ao_reinit_pending) {
+                m_pot_ao_reinit_pending = false;
+                m_pot_ao_reinit_requested = true;
+            }
         } else if (m_pot_ao_lumen_runtime_cvar_attempts >= 600) {
             SPDLOG_WARN("[PoT][AO/Lumen] preset cvars were not found after {} attempts; giving up", m_pot_ao_lumen_runtime_cvar_attempts);
             m_pot_ao_lumen_runtime_cvars_done = true;

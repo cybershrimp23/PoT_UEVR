@@ -224,6 +224,10 @@ public:
     // whether the expensive telemetry work should run this call.
     bool pot_telemetry_active() { return m_pot_camera_telemetry->value(); }
 
+    // Path of Titans ambient occlusion preset selector: 0 = no AO passes,
+    // 1 = validated Lumen path. Consumed by CVarManager's startup preset pass.
+    int32_t pot_ao_mode() { return m_pot_ao_mode->value(); }
+
     void reinitialize_renderer() {
         if (m_is_d3d12) {
             m_d3d12.force_reset();
@@ -1470,6 +1474,7 @@ private:
     const ModSlider::Ptr m_pot_motion_release{ ModSlider::create(generate_name("PotMotionRelease"), 0.1f, 10.0f, 1.0f) };
     const ModSlider::Ptr m_pot_motion_avg_window{ ModSlider::create(generate_name("PotMotionAvgWindow"), 1.0f, 12.0f, 4.0f) };
     const ModToggle::Ptr m_pot_camera_telemetry{ ModToggle::create(generate_name("PotCameraTelemetry")) };
+    const ModCombo::Ptr m_pot_ao_mode{ ModCombo::create(generate_name("PotAmbientOcclusion"), std::vector<std::string>{"No Ambient Occlusion", "Ambient Occlusion"}, 1) };
     const ModToggle::Ptr m_extreme_compat_mode{ ModToggle::create(generate_name("ExtremeCompatibilityMode"), false, true) };
     const ModToggle::Ptr m_uncap_framerate{ ModToggle::create(generate_name("UncapFramerate"), true) };
     const ModToggle::Ptr m_disable_blur_widgets{ ModToggle::create(generate_name("DisableBlurWidgets"), true) };
@@ -1830,6 +1835,7 @@ public:
             *m_pot_motion_release,
             *m_pot_motion_avg_window,
             *m_pot_camera_telemetry,
+            *m_pot_ao_mode,
             *m_extreme_compat_mode,
             *m_uncap_framerate,
             *m_disable_hdr_compositing,

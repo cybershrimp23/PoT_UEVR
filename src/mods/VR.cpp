@@ -7824,6 +7824,15 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
         m_match_game_fov->value() = true;
     }
 
+    if (is_path_of_titans_executable()) {
+        const auto raw = cfg.get<std::string>("VR_PotAmbientOcclusion");
+        const auto as_int = cfg.get<int32_t>("VR_PotAmbientOcclusion");
+        spdlog::info("[PoT][AO] mode loaded: {} (set_defaults={} raw_in_cfg={} int_in_cfg={})",
+            m_pot_ao_mode->value(), set_defaults,
+            raw.has_value() ? *raw : std::string{"<absent>"},
+            as_int.has_value() ? (int32_t)*as_int : -999);
+    }
+
     if (get_runtime() != nullptr && get_runtime()->loaded) {
         get_runtime()->on_config_load(cfg, set_defaults);
 
@@ -8523,6 +8532,15 @@ void VR::on_present() {
         } else {
             m_first_wear_seen_time = {};
         }
+    }
+
+    // Path of Titans: an ambient occlusion mode switch re-applied its preset
+    // cvars; fire exactly one runtime reinitialize so the render graph is
+    // rebuilt around them (this is what we're testing for live Lumen toggle).
+    if (is_path_of_titans_executable() && m_cvar_manager && m_cvar_manager->pot_ao_reinit_requested() && is_hmd_active()) {
+        m_cvar_manager->clear_pot_ao_reinit_requested();
+        spdlog::info("[PoT][AO] Performing runtime reinitialize for ambient occlusion mode switch");
+        runtime->wants_reinitialize = true;
     }
 
     runtime->consume_events(nullptr);
@@ -10515,7 +10533,16 @@ void VR::update_pot_damage_overlay() {
 
         const auto now = std::chrono::steady_clock::now();
 
-        if (m_pot_damage_debug_log_time.time_since_epoch().count() == 0 || now - m_pot_damage_debug_log_time >= std::chrono::seconds(5)) {
+        // Periodic status is only interesting while something is actually
+        // active; a silent idle session must not emit anything. The timer is
+        // left untouched while idle, so activity logs within 5 s of starting.
+        const bool any_active =
+            m_pot_damage_mat_signal[0] > 0.001f || m_pot_damage_mat_signal[1] > 0.001f || m_pot_damage_mat_signal[2] > 0.001f ||
+            std::max(0.0f, m_pot_damage_last_alpha[0]) > 0.001f ||
+            std::max(0.0f, m_pot_damage_last_alpha[1]) > 0.001f ||
+            std::max(0.0f, m_pot_damage_last_alpha[2]) > 0.001f;
+
+        if (any_active && (m_pot_damage_debug_log_time.time_since_epoch().count() == 0 || now - m_pot_damage_debug_log_time >= std::chrono::seconds(5))) {
             m_pot_damage_debug_log_time = now;
             spdlog::info("[PoT][DamageVignette] mat signal: red {:.3f} | green {:.3f} | blue {:.3f} | pushed {:.3f} {:.3f} {:.3f} | material watches {}",
                 m_pot_damage_mat_signal[0], m_pot_damage_mat_signal[1], m_pot_damage_mat_signal[2],
@@ -11543,6 +11570,18 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         if (m_pot_damage_vignette_enabled->value()) {
             m_pot_damage_vignette_scale->draw("Damage Intensity Scale");
         }
+
+        ImGui::Separator();
+        const auto ao_mode_before = m_pot_ao_mode->value();
+        m_pot_ao_mode->draw("Ambient Occlusion");
+        if (m_pot_ao_mode->value() != ao_mode_before) {
+            // Persist immediately: a switch followed by an abrupt quit must
+            // still be in config.txt when the game starts again.
+            if (g_framework) {
+                g_framework->deferred_save_config();
+            }
+        }
+        ImGui::TextWrapped("No Ambient Occlusion kills every AO pass; Ambient Occlusion applies the validated Lumen preset. The choice is saved and applied at game start. Lumen can be switched ON mid-session (the renderer reinitializes), but it cannot be torn down live - switch to No Ambient Occlusion and restart the game.");
 
         if (ImGui::Button("Dump Damage Widget Properties")) {
             dump_pot_damage_widget_properties();
