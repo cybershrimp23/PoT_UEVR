@@ -1450,11 +1450,12 @@ private:
     const ModToggle::Ptr m_pot_damage_vignette_enabled{ ModToggle::create(generate_name("PotDamageVignette"), true) };
     const ModSlider::Ptr m_pot_damage_vignette_scale{ ModSlider::create(generate_name("PotDamageVignetteScale"), 0.0f, 4.0f, 1.0f) };
     const ModToggle::Ptr m_pot_motion_vignette_enabled{ ModToggle::create(generate_name("PotMotionVignette"), true) };
-    const ModSlider::Ptr m_pot_motion_base{ ModSlider::create(generate_name("PotMotionBase"), 0.0f, 4.0f, 0.0f) };
+    const ModSlider::Ptr m_pot_motion_base{ ModSlider::create(generate_name("PotMotionBase"), 0.0f, 8.0f, 0.0f) };
     const ModSlider::Ptr m_pot_motion_peak{ ModSlider::create(generate_name("PotMotionPeak"), 0.0f, 8.0f, 5.0f) };
     const ModSlider::Ptr m_pot_motion_threshold{ ModSlider::create(generate_name("PotMotionThreshold"), 10.0f, 180.0f, 60.0f) };
     const ModSlider::Ptr m_pot_motion_max_speed{ ModSlider::create(generate_name("PotMotionMaxSpeed"), 60.0f, 540.0f, 240.0f) };
     const ModSlider::Ptr m_pot_motion_smoothing{ ModSlider::create(generate_name("PotMotionSmoothing"), 0.5f, 30.0f, 8.0f) };
+    const ModSlider::Ptr m_pot_motion_release{ ModSlider::create(generate_name("PotMotionRelease"), 0.1f, 10.0f, 1.0f) };
     const ModSlider::Ptr m_pot_motion_avg_window{ ModSlider::create(generate_name("PotMotionAvgWindow"), 1.0f, 12.0f, 4.0f) };
     const ModToggle::Ptr m_extreme_compat_mode{ ModToggle::create(generate_name("ExtremeCompatibilityMode"), false, true) };
     const ModToggle::Ptr m_uncap_framerate{ ModToggle::create(generate_name("UncapFramerate"), true) };
@@ -1813,6 +1814,7 @@ public:
             *m_pot_motion_threshold,
             *m_pot_motion_max_speed,
             *m_pot_motion_smoothing,
+            *m_pot_motion_release,
             *m_pot_motion_avg_window,
             *m_extreme_compat_mode,
             *m_uncap_framerate,
@@ -2130,6 +2132,7 @@ private:
     double m_pot_motion_last_pitch{0.0};
     float m_pot_motion_alpha{0.0f};
     float m_pot_motion_written_alpha{-1.0f};
+    float m_pot_motion_speed_display{0.0f};
     std::array<float, 16> m_pot_motion_avg_buf{};
     size_t m_pot_motion_avg_ptr{0};
     size_t m_pot_motion_avg_count{0};

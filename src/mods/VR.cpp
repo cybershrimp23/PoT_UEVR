@@ -9007,6 +9007,7 @@ void VR::update_pot_motion_vignette(sdk::UGameEngine* engine, float delta) {
         if (m_pot_motion_written_alpha != 0.0f) {
             m_pot_motion_alpha = 0.0f;
             m_pot_motion_written_alpha = 0.0f;
+            m_pot_motion_speed_display = 0.0f;
             m_pot_motion_last_time = {};
             m_pot_motion_avg_ptr = 0;
             m_pot_motion_avg_count = 0;
@@ -9080,7 +9081,10 @@ void VR::update_pot_motion_vignette(sdk::UGameEngine* engine, float delta) {
     const auto threshold = m_pot_motion_threshold->value();
     const auto max_speed = m_pot_motion_max_speed->value();
     const auto smoothing = m_pot_motion_smoothing->value();
+    const auto release = m_pot_motion_release->value();
     const auto window = (size_t)std::clamp((int)m_pot_motion_avg_window->value(), 1, 16);
+
+    m_pot_motion_speed_display = speed;
 
     auto target = base;
 
@@ -9107,8 +9111,11 @@ void VR::update_pot_motion_vignette(sdk::UGameEngine* engine, float delta) {
         target = sum / (float)m_pot_motion_avg_count;
     }
 
-    // Exponential smoothing toward the averaged target.
-    const auto a = std::min(smoothing * std::max(delta, 0.0001f), 1.0f);
+    // Asymmetric envelope: close in at the rise rate, open back at the (much
+    // slower) release rate. A symmetric EMA tracks the boom's velocity jitter
+    // downward as fast as upward, which reads as pulsing on every swing.
+    const auto rate = target > m_pot_motion_alpha ? smoothing : release;
+    const auto a = std::min(rate * std::max(delta, 0.0001f), 1.0f);
     m_pot_motion_alpha += (target - m_pot_motion_alpha) * a;
 
     if (std::abs(m_pot_motion_alpha - m_pot_motion_written_alpha) > 0.001f) {
@@ -11012,16 +11019,17 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             m_pot_motion_peak->draw("Peak (full close-in)");
             m_pot_motion_threshold->draw("Threshold (deg/sec)");
             m_pot_motion_max_speed->draw("Max Speed (deg/sec)");
-            m_pot_motion_smoothing->draw("Smoothing");
+            m_pot_motion_smoothing->draw("Rise Rate (per sec)");
+            m_pot_motion_release->draw("Release Rate (per sec)");
             m_pot_motion_avg_window->draw("Averaging Window (frames)");
             ImGui::Unindent();
         }
 
-        ImGui::TextWrapped("Pushed alphas: red %.2f | green %.2f | blue %.2f | motion %.2f (smoothed %.2f)",
+        ImGui::TextWrapped("Pushed alphas: red %.2f | green %.2f | blue %.2f | motion %.2f (smoothed %.2f, camera speed %.0f deg/s)",
             std::max(0.0f, m_pot_damage_last_alpha[0]),
             std::max(0.0f, m_pot_damage_last_alpha[1]),
             std::max(0.0f, m_pot_damage_last_alpha[2]),
-            m_pot_motion_written_alpha, m_pot_motion_alpha);
+            m_pot_motion_written_alpha, m_pot_motion_alpha, m_pot_motion_speed_display);
         ImGui::TextWrapped("Material opacity signal: red %.3f | green %.3f | blue %.3f",
             m_pot_damage_mat_signal[0],
             m_pot_damage_mat_signal[1],

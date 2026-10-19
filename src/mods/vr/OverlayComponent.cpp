@@ -1326,13 +1326,12 @@ PSOut ps_main(float4 pos : SV_Position) {
 
     if (g_solid < 0.5f) {
         const float dist = sqrt(dx * dx + dy * dy) / 1.41421356f * 2.0f;
-        float t = (dist - g_start) / max(g_end - g_start, 0.0001f);
-        t = saturate(t);
-        s = t * t * (3.0f - 2.0f * t);
-        // Gain > 1 pushes the falloff outward, darkening more of the screen;
-        // overlay alpha itself saturates at 1, so texture alpha is the only
-        // remaining strength axis.
-        s = saturate(s * max(g_gain, 1.0f));
+        // Gain scales the distance, not just the alpha: the whole falloff
+        // ring moves inward, so the clear center hole shrinks (gain 8 leaves
+        // roughly a 5% hole) instead of only saturating the outer band.
+        const float t = (dist * max(g_gain, 1.0f) - g_start) / max(g_end - g_start, 0.0001f);
+        const float c = saturate(t);
+        s = c * c * (3.0f - 2.0f * c);
     }
 
     PSOut o;
@@ -1462,7 +1461,9 @@ bool OverlayComponent::ensure_pot_vignette_texture_dx12(int slot, float gain) {
     const auto end = m_pot_vignette_end->value();
     const bool solid = m_pot_vignette_solid_debug->value();
 
-    gain = std::max(gain, 1.0f);
+    // Quantize gain to 0.5 steps: hole closure still reads continuous, but a
+    // ramp renders a bounded ~16 passes instead of one every frame.
+    gain = std::max(1.0f, std::round(gain * 2.0f) * 0.5f);
 
     // Shape knobs are shared by all slots; bump a version counter so every
     // slot re-renders once after a shape change.
@@ -1473,10 +1474,9 @@ bool OverlayComponent::ensure_pot_vignette_texture_dx12(int slot, float gain) {
         ++m_pot_vignette_shape_version;
     }
 
-    auto& ctx = m_pot_vignette_ctx[slot];
-    const bool texture_exists = ctx.texture != nullptr;
+    auto& front_ctx = m_pot_vignette_ctx[slot][m_pot_vignette_front[slot]];
 
-    if (texture_exists && m_pot_vignette_slot_shape_version[slot] == m_pot_vignette_shape_version
+    if (front_ctx.texture != nullptr && m_pot_vignette_slot_shape_version[slot] == m_pot_vignette_shape_version
         && gain == m_pot_vignette_last_gain[slot]) {
         return true; // idle: no CPU or GPU work at all
     }
@@ -1493,7 +1493,13 @@ bool OverlayComponent::ensure_pot_vignette_texture_dx12(int slot, float gain) {
         return false;
     }
 
-    if (!texture_exists) {
+    // Render into the BACK buffer and flip when complete: the compositor keeps
+    // sampling the finished front texture throughout, so partial/cleared
+    // content is never visible (this was the source of the per-render pulse).
+    const int back = 1 - m_pot_vignette_front[slot];
+    auto& ctx = m_pot_vignette_ctx[slot][back];
+
+    if (ctx.texture == nullptr) {
         // Render-target-capable texture in the same resource style the OpenVR
         // UI texture uses for compositor submission.
         D3D12_RESOURCE_DESC tex_desc{};
@@ -1527,16 +1533,27 @@ bool OverlayComponent::ensure_pot_vignette_texture_dx12(int slot, float gain) {
             return false;
         }
 
-        m_pot_vignette_in_psr[slot] = false;
+        m_pot_vignette_in_psr[slot][back] = false;
     }
 
-    d3d12::CommandContext render_ctx{};
-    if (!render_ctx.setup(L"PotVignetteRender") || !render_ctx.ready()) {
-        SPDLOG_ERROR_EVERY_N_SEC(5, "[PotVignette] render CommandContext unavailable");
-        return false;
+    // One persistent render context for the whole session: no per-render
+    // allocator/fence churn on the present thread.
+    if (!m_pot_vignette_render_ctx_ready || !m_pot_vignette_render_ctx.ready()) {
+        if (!m_pot_vignette_render_ctx.setup(L"PotVignetteRender")) {
+            SPDLOG_ERROR_EVERY_N_SEC(5, "[PotVignette] render CommandContext setup failed");
+            m_pot_vignette_render_ctx_ready = false;
+            return false;
+        }
+
+        m_pot_vignette_render_ctx_ready = m_pot_vignette_render_ctx.ready();
+
+        if (!m_pot_vignette_render_ctx_ready) {
+            SPDLOG_ERROR_EVERY_N_SEC(5, "[PotVignette] render CommandContext not ready");
+            return false;
+        }
     }
 
-    auto* cmd = render_ctx.cmd_list.Get();
+    auto* cmd = m_pot_vignette_render_ctx.cmd_list.Get();
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1544,7 +1561,7 @@ bool OverlayComponent::ensure_pot_vignette_texture_dx12(int slot, float gain) {
     barrier.Transition.pResource = ctx.texture.Get();
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-    if (m_pot_vignette_in_psr[slot]) {
+    if (m_pot_vignette_in_psr[slot][back]) {
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         cmd->ResourceBarrier(1, &barrier);
@@ -1574,11 +1591,12 @@ bool OverlayComponent::ensure_pot_vignette_texture_dx12(int slot, float gain) {
 
     // execute() only submits when has_commands is set (raw cmd_list recording
     // does not set it; lesson from the research fork).
-    render_ctx.has_commands = true;
-    render_ctx.execute();
-    render_ctx.wait(INFINITE);
+    m_pot_vignette_render_ctx.has_commands = true;
+    m_pot_vignette_render_ctx.execute();
+    m_pot_vignette_render_ctx.wait(INFINITE);
 
-    m_pot_vignette_in_psr[slot] = true;
+    m_pot_vignette_in_psr[slot][back] = true;
+    m_pot_vignette_front[slot] = back;
     m_pot_vignette_last_gain[slot] = gain;
     m_pot_vignette_slot_shape_version[slot] = m_pot_vignette_shape_version;
 
@@ -1702,7 +1720,7 @@ void OverlayComponent::update_pot_vignette_pool_openvr() {
         check("SetOverlayTransformAbsolute", vr::VROverlay()->SetOverlayTransformAbsolute(handle, vr::TrackingUniverseStanding, (vr::HmdMatrix34_t*)&steamvr_matrix));
 
         vr::D3D12TextureData_t texture_data{
-            m_pot_vignette_ctx[slot].texture.Get(),
+            m_pot_vignette_ctx[slot][m_pot_vignette_front[slot]].texture.Get(),
             g_framework->get_d3d12_hook()->get_command_queue(),
             0
         };
