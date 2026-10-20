@@ -10195,6 +10195,15 @@ void VR::update_pot_damage_overlay(sdk::UGameEngine* engine) {
     // fresh level) rebuilds its HUD widgets, so that is the event that arms a
     // discovery sweep - no fixed-timer GObjects walking during gameplay.
     if (engine != nullptr) {
+        // A world swap (logout to menu, re-enter, map change) always rebuilds
+        // the HUD. Arm a sweep on it so the address-reuse edge case - where
+        // the new puppet lands on the old puppet's freed address and the view
+        // target change goes unnoticed - can never suppress a rescan.
+        if (const auto world = engine->get_world(); (void*)world != m_pot_damage_last_world) {
+            m_pot_damage_last_world = (void*)world;
+            m_pot_damage_rescan_requested = true;
+        }
+
         const auto pcm = get_primary_player_camera_manager(engine);
 
         if (const auto target = read_pcm_view_target(pcm); target.has_value() && *target != nullptr) {
@@ -10462,6 +10471,13 @@ void VR::update_pot_damage_overlay(sdk::UGameEngine* engine) {
             const auto vis = (const uint8_t*)((const uint8_t*)entry.object + entry.visibility_offset);
 
             if (IsBadReadPtr(vis, sizeof(uint8_t)) || *vis == hidden_mode_hot) {
+                continue;
+            }
+
+            // Teardown guard: ProcessEvent on a widget whose outer chain and
+            // delegates are being destroyed can corrupt the heap. The game
+            // cannot meaningfully un-hide a pending-kill widget anyway.
+            if (((sdk::UObject*)entry.object)->is_pending_kill_or_unreachable()) {
                 continue;
             }
 

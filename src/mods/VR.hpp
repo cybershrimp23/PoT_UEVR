@@ -2132,6 +2132,7 @@ private:
     bool m_pot_damage_scan_active{false};
     bool m_pot_damage_rescan_requested{true};
     sdk::UObject* m_pot_damage_last_view_target{nullptr};
+    void* m_pot_damage_last_world{nullptr};
     std::chrono::steady_clock::time_point m_pot_damage_next_scan{};
     std::unordered_set<void*> m_pot_damage_discovery_logged{};
 
