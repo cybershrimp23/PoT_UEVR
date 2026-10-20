@@ -4863,7 +4863,7 @@ bool VR::should_defer_stalker2_openxr_frame_for_transition(const char* reason) {
 void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     ZoneScopedN(__FUNCTION__);
 
-    update_pot_damage_overlay();
+    update_pot_damage_overlay(engine);
     update_pot_motion_vignette(engine, delta);
     update_pot_view_target_watch(engine);
 
@@ -10171,7 +10171,7 @@ void VR::dump_pot_damage_widget_properties() {
     }
 }
 
-void VR::update_pot_damage_overlay() {
+void VR::update_pot_damage_overlay(sdk::UGameEngine* engine) {
     if (!is_path_of_titans_executable()) {
         return;
     }
@@ -10190,13 +10190,34 @@ void VR::update_pot_damage_overlay() {
 
     const auto tick_now = std::chrono::steady_clock::now();
 
+    // Puppet attach/detach detection: the view target pointer read is cached
+    // offset arithmetic only, so this is safe every tick. A new puppet (or a
+    // fresh level) rebuilds its HUD widgets, so that is the event that arms a
+    // discovery sweep - no fixed-timer GObjects walking during gameplay.
+    if (engine != nullptr) {
+        const auto pcm = get_primary_player_camera_manager(engine);
+
+        if (const auto target = read_pcm_view_target(pcm); target.has_value() && *target != nullptr) {
+            if (*target != m_pot_damage_last_view_target) {
+                m_pot_damage_last_view_target = *target;
+                m_pot_damage_rescan_requested = true;
+            }
+        }
+    }
+
     // Discovery scan: the full GObjects walk (a string allocation per object)
-    // runs only every 3 seconds, sliced across ticks so it cannot hitch the
-    // game thread. Between scans, the hot pass below keeps every known widget
-    // hidden, reacting within a single tick to damage-driven un-hides.
-    if (!m_pot_damage_scan_active &&
-        (m_pot_damage_next_scan.time_since_epoch().count() == 0 || tick_now >= m_pot_damage_next_scan)) {
+    // only runs when armed by a puppet change, when the tracked set went
+    // fully stale, or - on a 3 s retry - while nothing has been found yet
+    // (the HUD may not exist until the first attach completes). Between
+    // scans, the hot pass below keeps every known widget hidden, reacting
+    // within a single tick to damage-driven un-hides.
+    const bool retry_due = m_pot_hidden_damage_widgets.empty() &&
+        m_pot_damage_next_scan.time_since_epoch().count() != 0 &&
+        tick_now >= m_pot_damage_next_scan;
+
+    if (!m_pot_damage_scan_active && (m_pot_damage_rescan_requested || retry_due)) {
         m_pot_damage_scan_active = true;
+        m_pot_damage_rescan_requested = false;
         m_pot_damage_overlay_scan_cursor = 0;
     }
 
@@ -10409,7 +10430,16 @@ void VR::update_pot_damage_overlay() {
 
         if (m_pot_damage_overlay_scan_cursor == 0) {
             m_pot_damage_scan_active = false;
-            m_pot_damage_next_scan = tick_now + std::chrono::seconds(3);
+
+            // Nothing tracked yet (menu, loading, or the HUD has not been
+            // created post-attach): retry until the first widget is found.
+            // Once tracked, no timer is armed - only puppet changes and full
+            // cache staleness re-arm a sweep.
+            if (m_pot_hidden_damage_widgets.empty()) {
+                m_pot_damage_next_scan = tick_now + std::chrono::seconds(3);
+            } else {
+                m_pot_damage_next_scan = std::chrono::steady_clock::time_point{};
+            }
         }
     }
 
@@ -10492,10 +10522,12 @@ void VR::update_pot_damage_overlay() {
         }
 
         // Once every tracked entry is recycled (map reload), drop the set and
-        // let the rolling sweep rediscover the new instances.
+        // arm a rescan immediately; the widgets will not come back until the
+        // game spawns replacements.
         if (stale_count > 0 && stale_count >= m_pot_hidden_damage_widgets.size() + m_pot_damage_owner_widgets.size()) {
             m_pot_hidden_damage_widgets.clear();
             m_pot_damage_owner_widgets.clear();
+            m_pot_damage_rescan_requested = true;
         }
 
         const auto scale = m_pot_damage_vignette_scale->value();

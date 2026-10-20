@@ -197,7 +197,10 @@ public:
     // Path of Titans: the UMG blood damage overlay (widget "DamageImage") draws a
     // flat-screen rectangle inside the stereo view. Hide it unconditionally for
     // this title, like the legacy Lua script did.
-    void update_pot_damage_overlay();
+    // Discovery is event-driven: a full GObjects sweep runs when the camera
+    // ViewTarget (puppet) changes and while nothing is tracked yet, never on a
+    // fixed timer during gameplay.
+    void update_pot_damage_overlay(sdk::UGameEngine* engine);
 
     // Debug: log every reflected property (name, type, offset, current value
     // where readable) of each tracked DamageImage widget and its owning
@@ -1474,7 +1477,7 @@ private:
     const ModSlider::Ptr m_pot_motion_release{ ModSlider::create(generate_name("PotMotionRelease"), 0.1f, 10.0f, 1.0f) };
     const ModSlider::Ptr m_pot_motion_avg_window{ ModSlider::create(generate_name("PotMotionAvgWindow"), 1.0f, 12.0f, 4.0f) };
     const ModToggle::Ptr m_pot_camera_telemetry{ ModToggle::create(generate_name("PotCameraTelemetry")) };
-    const ModCombo::Ptr m_pot_ao_mode{ ModCombo::create(generate_name("PotAmbientOcclusion"), std::vector<std::string>{"No Ambient Occlusion", "Ambient Occlusion"}, 1) };
+    const ModCombo::Ptr m_pot_ao_mode{ ModCombo::create(generate_name("PotAmbientOcclusion"), std::vector<std::string>{"No Ambient Occlusion", "Ambient Occlusion"}, 0) };
     const ModToggle::Ptr m_extreme_compat_mode{ ModToggle::create(generate_name("ExtremeCompatibilityMode"), false, true) };
     const ModToggle::Ptr m_uncap_framerate{ ModToggle::create(generate_name("UncapFramerate"), true) };
     const ModToggle::Ptr m_disable_blur_widgets{ ModToggle::create(generate_name("DisableBlurWidgets"), true) };
@@ -2112,8 +2115,9 @@ private:
     uint64_t m_pot_cam_jumps_total{};
     std::chrono::steady_clock::time_point m_pot_cam_jump_last_log{};
 
-    // Path of Titans damage overlay hiding: periodic discovery scan plus a
-    // per-tick hot pass over cached references only.
+    // Path of Titans damage overlay hiding: event-driven discovery scan
+    // (puppet attach / cache staleness) plus a per-tick hot pass over cached
+    // references only.
     struct PotHiddenWidget {
         sdk::UObjectBase* object{nullptr};
         uint32_t index{};
@@ -2126,6 +2130,8 @@ private:
     std::vector<PotHiddenWidget> m_pot_damage_owner_widgets{};
     uint32_t m_pot_damage_overlay_scan_cursor{0};
     bool m_pot_damage_scan_active{false};
+    bool m_pot_damage_rescan_requested{true};
+    sdk::UObject* m_pot_damage_last_view_target{nullptr};
     std::chrono::steady_clock::time_point m_pot_damage_next_scan{};
     std::unordered_set<void*> m_pot_damage_discovery_logged{};
 

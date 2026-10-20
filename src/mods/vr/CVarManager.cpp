@@ -576,7 +576,7 @@ bool force_pot_ao_lumen_runtime_cvars_once(int attempt) {
     };
 
     const auto vr = VR::get();
-    const int32_t mode = vr ? vr->pot_ao_mode() : 1;
+    const int32_t mode = vr ? vr->pot_ao_mode() : 0;
     const bool no_ao = (mode == 0);
 
     const ForcedCVar* forced_list = no_ao ? forced_cvars_none.data() : forced_cvars_lumen.data();
@@ -979,7 +979,7 @@ void CVarManager::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
 
     if (m_pot_ao_lumen_runtime_cvars_done && m_pot_ao_applied_mode >= 0) {
         const auto vr = VR::get();
-        const int32_t pot_mode_now = vr ? vr->pot_ao_mode() : 1;
+        const int32_t pot_mode_now = vr ? vr->pot_ao_mode() : 0;
 
         // The user flipped the Ambient Occlusion combo: re-apply the matching
         // preset immediately, then request one runtime reinitialize so the
@@ -999,7 +999,7 @@ void CVarManager::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
             m_pot_ao_lumen_runtime_cvars_done = true;
 
             const auto vr = VR::get();
-            m_pot_ao_applied_mode = vr ? vr->pot_ao_mode() : 1;
+            m_pot_ao_applied_mode = vr ? vr->pot_ao_mode() : 0;
 
             if (m_pot_ao_reinit_pending) {
                 m_pot_ao_reinit_pending = false;
